@@ -411,6 +411,23 @@ def _redacted(e: Exception) -> str:
     return type(e).__name__ + (f" (HTTP {status})" if status is not None else "")
 
 
+def _taker_step(mode: str, client, plays: list[Play], store, now: pd.Timestamp, rows_before: int,
+                bets_sha: str | None, bankroll_raw: bytes | None, bankroll_sha: str | None) -> bool:
+    """The taker run (live/dry_run under BOT_POLICY=taker, shadow under maker) and its
+    bet-log and bankroll pushes. Returns had_error."""
+    rows, had_error = run(mode, client, KALSHI_START_BANKROLL, plays,
+                          KALSHI_BETS_PATH, KALSHI_BANKROLL_PATH, now=now)
+    print(f"  {'taker (shadow): ' if mode == 'shadow' else ''}{summarize(rows)}")
+
+    new_rows = load_bet_log(KALSHI_BETS_PATH).iloc[rows_before:]
+    if not new_rows.empty:
+        _push_bet_log(store, new_rows, bets_sha)
+    new_bankroll = KALSHI_BANKROLL_PATH.read_bytes()
+    if _bankroll_numbers(new_bankroll) != _bankroll_numbers(bankroll_raw):
+        store.put(BANKROLL_FILE, new_bankroll, bankroll_sha, "bot: bankroll")
+    return had_error
+
+
 def main(argv: list[str] | None = None, store=None, client=None, now=None) -> int:
     parser = argparse.ArgumentParser(description="Kalshi auto-bettor")
     parser.add_argument("--mode", choices=["off", "dry_run", "live"], default=BETTING_MODE)
@@ -456,21 +473,22 @@ def main(argv: list[str] | None = None, store=None, client=None, now=None) -> in
         # betting is live, so a maker->taker flip still closes out the last window.
         client = client or KalshiClient()
         housekeeping = args.mode == "live"
-        if BOT_POLICY == "maker":
-            _maker_step(args.mode, client, plays, store, now, housekeeping)
-        taker_mode = args.mode if BOT_POLICY == "taker" else "shadow"
-        rows, had_error = run(taker_mode, client, KALSHI_START_BANKROLL, plays,
-                              KALSHI_BETS_PATH, KALSHI_BANKROLL_PATH, now=now)
-        print(f"  {'' if BOT_POLICY == 'taker' else 'taker (shadow): '}{summarize(rows)}")
-
-        new_rows = load_bet_log(KALSHI_BETS_PATH).iloc[rows_before:]
-        if not new_rows.empty:
-            _push_bet_log(store, new_rows, bets_sha)
-        new_bankroll = KALSHI_BANKROLL_PATH.read_bytes()
-        if _bankroll_numbers(new_bankroll) != _bankroll_numbers(bankroll_raw):
-            store.put(BANKROLL_FILE, new_bankroll, bankroll_sha, "bot: bankroll")
         if BOT_POLICY == "taker":
+            had_error = _taker_step(args.mode, client, plays, store, now,
+                                    rows_before, bets_sha, bankroll_raw, bankroll_sha)
             _maker_step("shadow", client, plays, store, now, housekeeping)
+        else:
+            # The read-only shadow taker runs before the maker posts this run's bids:
+            # Kalshi's balance excludes resting-order collateral, so sizing after them
+            # would shrink the shadow stakes (and the pushed bankroll). Its failure is
+            # recorded but must not stop the maker, which is the policy actually trading.
+            try:
+                had_error = _taker_step("shadow", client, plays, store, now,
+                                        rows_before, bets_sha, bankroll_raw, bankroll_sha)
+            except Exception as e:  # public logs: exception type and HTTP status only
+                print(f"  ✗ taker (shadow) failed: {_redacted(e)}")
+                had_error = True
+            _maker_step(args.mode, client, plays, store, now, housekeeping)
     except Exception as e:  # public logs: exception type and HTTP status only
         print(f"  ✗ run failed: {_redacted(e)}")
         return 1

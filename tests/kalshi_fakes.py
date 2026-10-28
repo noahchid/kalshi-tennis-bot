@@ -52,7 +52,9 @@ class FakeKalshi:
     is a set of market tickers whose maker orders are rejected as post-only
     crosses (raising `crossing_exc` if set, else a KalshiAPIError).
     `fail_cancel` is a set of order ids whose cancel raises. Every create,
-    cancel and fills read is appended to `calls` in order.
+    cancel and fills read is appended to `calls` in order. Like Kalshi, the
+    balance excludes the collateral of resting orders placed here
+    (price x unfilled count), until they fill or are cancelled.
     """
 
     def __init__(self, markets=None, cash=500.0, positions=None, orders=None,
@@ -72,12 +74,16 @@ class FakeKalshi:
         self.placed = []
         self.cancelled = []
         self.calls = []
+        self._collateral_ids = set()  # resting orders created here hold collateral
 
     def list_markets(self, series_ticker, status="open", min_close_ts=None):
         return [m for m in self.markets if m["event_ticker"].startswith(series_ticker + "-")]
 
     def get_balance(self, exchange_index=None):
-        return self.cash
+        reserved = sum(float(o["yes_price_dollars"]) * (o["count"] - float(o["fill_count_fp"]))
+                       for o in self.orders
+                       if o.get("order_id") in self._collateral_ids and o["status"] == "resting")
+        return round(self.cash - reserved, 2)
 
     def get_positions(self, event_ticker=None):
         return [p for p in self.positions
@@ -126,6 +132,7 @@ class FakeKalshi:
                                 "client_order_id": client_order_id, "status": "resting",
                                 "yes_price_dollars": f"{price:.4f}", "count": count,
                                 "fill_count_fp": "0.00"})
+            self._collateral_ids.add(order_id)
             return {"order_id": order_id, "client_order_id": client_order_id,
                     "status": "resting", "fill_count": "0.00", "remaining_count": f"{count:.2f}"}
         filled = int(count * self.fill_ratio)

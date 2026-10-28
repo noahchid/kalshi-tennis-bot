@@ -726,3 +726,39 @@ def test_workflow_passes_policy_env():
     wf = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "bot.yml").read_text()
     assert "BOT_POLICY: ${{ vars.BOT_POLICY || 'taker' }}" in wf
     assert "MAKER_STOP_HOURS: ${{ vars.MAKER_STOP_HOURS || '4' }}" in wf
+
+
+def test_maker_policy_shadow_taker_sized_before_maker_bids_reserve_cash(monkeypatch, tmp_path):
+    # Cash binds the bankroll ($60 < $1000 start). Resting maker bids would reserve
+    # 5 x .44 + 5 x .56 = $5 of it, so a shadow taker sized after them would see $55.
+    reference = _fake()
+    reference.cash = 60.0
+    expected, _ = run("shadow", reference, 1000.0, [_play("James Duckworth", "Lorenzo Sonego")],
+                      tmp_path / "ref_bets.parquet", tmp_path / "ref_br.json", now=NOW, kalshi_env="demo")
+    assert expected[0]["status"] == "shadow" and expected[0]["bankroll"] == 60.0
+
+    store, fake = _FakeStore({"plays.json": _plays_bytes()}), _fake()
+    fake.cash = 60.0
+    assert _main(monkeypatch, tmp_path, store, fake, policy="maker") == 0
+    assert len(fake.placed) == 2 and fake.get_balance() == pytest.approx(55.0)  # bids hold collateral
+    log = _read_parquet_file(store, "kalshi_bets.parquet")
+    assert list(log.status) == ["shadow"]
+    assert log.contracts.iloc[0] == expected[0]["contracts"]
+    assert log.bankroll.iloc[0] == 60.0
+    assert json.loads(store.files["kalshi_bankroll.json"])["bankroll"] == 60.0
+
+
+def test_maker_policy_shadow_taker_exception_still_quotes_and_exits_1(monkeypatch, tmp_path, capsys):
+    import kalshi_bot.bettor as bettor_mod
+
+    def broken_run(*a, **kw):
+        raise RuntimeError("KXATPMATCH-26SEP23DUCSON James Duckworth")
+
+    monkeypatch.setattr(bettor_mod, "run", broken_run)
+    store, fake = _FakeStore({"plays.json": _plays_bytes()}), _fake()
+    assert _main(monkeypatch, tmp_path, store, fake, policy="maker") == 1
+    assert len(fake.placed) == 2 and all(p["post_only"] is True for p in fake.placed)
+    assert list(_read_parquet_file(store, "kalshi_quotes.parquet").status) == ["placed", "placed"]
+    out = capsys.readouterr().out
+    assert "taker (shadow) failed: RuntimeError" in out and "maker (live): placed 2" in out
+    assert "KXATP" not in out and "Duckworth" not in out
