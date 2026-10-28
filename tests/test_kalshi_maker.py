@@ -1,3 +1,4 @@
+import json
 import math
 
 import pandas as pd
@@ -258,11 +259,12 @@ def _mfake(**kw):
 
 
 def _mrun(fake, mode="live", now=RUN_NOW, state=None, seen=None, bankroll=100.0,
-          plays=None, housekeeping=True):
+          plays=None, housekeeping=True, placed_orders=None):
     state = state if state is not None else MakerState()
     seen = seen if seen is not None else set()
+    kw = {} if placed_orders is None else {"placed_orders": placed_orders}
     quotes, fills, counts = run_maker(mode, fake, plays if plays is not None else [_mplay()],
-                                      state, seen, bankroll, now, "demo", housekeeping)
+                                      state, seen, bankroll, now, "demo", housekeeping, **kw)
     return quotes, fills, counts
 
 
@@ -503,3 +505,164 @@ def test_mode_guards():
         _mrun(_mfake(), mode="off")
     with pytest.raises(ValueError):
         _mrun(_mfake(), mode="live", housekeeping=False)
+
+
+# ── final-review fixes ───────────────────────────────────────────────────────
+
+LATER = RUN_NOW + pd.Timedelta(minutes=15)
+
+
+def _maker_fill(fill_id, ticker=SON, order_id="own1", **kw):
+    f = {"fill_id": fill_id, "order_id": order_id, "ticker": ticker,
+         "created_time": "2026-10-28T23:30:00Z", "yes_price_dollars": "0.56",
+         "count_fp": "2.00", "is_taker": False, "fee_cost": "0.02"}
+    f.update(kw)
+    return {k: v for k, v in f.items() if v is not None}
+
+
+# I1: fills are tagged with the env they came from
+def test_fill_rows_carry_kalshi_env():
+    assert "kalshi_env" in FILL_COLUMNS
+    fake = _mfake()
+    state, seen = MakerState(), set()
+    first, _, _ = _mrun(fake, state=state, seen=seen)
+    fake.fill_resting(first[0]["order_id"], 1, ts=RUN_NOW + pd.Timedelta(minutes=3))
+    _, fills, _ = _mrun(fake, now=LATER, state=state, seen=seen)
+    assert len(fills) == 1 and fills[0]["kalshi_env"] == "demo"
+    assert set(fills[0]) == set(FILL_COLUMNS)
+
+
+# I1: one MakerState per env in the same JSON; the pre-env shape is prod's
+def test_env_states_are_separate_and_legacy_shape_is_prod():
+    from kalshi_bot.maker import load_env_state, store_env_state
+    legacy = b'{"first_mid": {"E1": {"E1-P": 0.46}}, "retired": {"E2": "2026-10-01T00:00:00+00:00"}}'
+    prod = load_env_state(legacy, "prod")
+    assert prod.first_mid("E1", "E1-P") == pytest.approx(0.46) and prod.is_retired("E2")
+    demo = load_env_state(legacy, "demo")
+    assert demo.first_mid("E1", "E1-P") is None and not demo.is_retired("E2")
+    demo.set_first_mid("E1", "E1-P", 0.60)
+    merged = store_env_state(legacy, "demo", demo)
+    assert set(json.loads(merged)) == {"prod", "demo"}
+    assert load_env_state(merged, "prod").first_mid("E1", "E1-P") == pytest.approx(0.46)
+    assert load_env_state(merged, "prod").is_retired("E2")
+    assert load_env_state(merged, "demo").first_mid("E1", "E1-P") == pytest.approx(0.60)
+    assert load_env_state(None, "prod").first_mid("E1", "E1-P") is None
+    assert store_env_state(merged, "demo", load_env_state(merged, "demo")) == merged
+
+
+# I3: classification by the bot's own placed order ids first, then the fill's
+# client_order_id, and only then the per-event order history
+def test_fill_classified_by_own_placed_order_id_without_order_lookup():
+    fake = _mfake()
+    fake.fills.append(_maker_fill("f1"))
+    _, fills, counts = _mrun(fake, mode="dry_run", placed_orders={"own1": "atpedge-mk-aaa-1"})
+    assert [f["fill_id"] for f in fills] == ["f1"]
+    assert fills[0]["client_order_id"] == "atpedge-mk-aaa-1"
+    assert fake.order_queries == [] and counts["fill_unclassified"] == 0
+
+
+def test_fill_coid_prefix_classifies_without_order_lookup():
+    fake = _mfake()
+    fake.fills.append(_maker_fill("f-taker", order_id="t9", client_order_id="atpedge-abc-1"))
+    fake.fills.append(_maker_fill("f-mk", order_id="m9", client_order_id="atpedge-mk-zzz-1"))
+    _, fills, _ = _mrun(fake, mode="dry_run")
+    assert [f["fill_id"] for f in fills] == ["f-mk"] and fake.order_queries == []
+
+
+def test_non_maker_fills_without_coid_look_up_orders_once_per_event():
+    fake = _mfake(orders=[{"order_id": "t1", "ticker": DUC, "status": "executed",
+                           "client_order_id": "atpedge-abc-1", "fill_count_fp": "3.00"}])
+    for i in range(3):
+        fake.fills.append(_maker_fill(f"ft{i}", ticker=DUC, order_id="t1"))
+    _, fills, _ = _mrun(fake, mode="dry_run")
+    assert fills == [] and fake.order_queries == [EV]
+
+
+def test_missing_is_taker_is_stored_as_unknown_and_does_not_halt():
+    fake = _mfake()
+    fake.fills.append(_maker_fill("f1", client_order_id="atpedge-mk-zzz-1", is_taker=None))
+    state = MakerState()
+    _, fills, counts = _mrun(fake, mode="dry_run", state=state)
+    assert fills[0]["is_taker"] is None
+    assert counts["taker_unknown"] == 1 and counts["taker_fill"] == 0
+    assert not state.halted
+
+
+@pytest.mark.parametrize("price", ["45", "0", "1.00", "-0.2", "nan", None])
+def test_fill_price_outside_unit_interval_is_unreadable(price):
+    fake = _mfake()
+    fake.fills.append(_maker_fill("f1", client_order_id="atpedge-mk-zzz-1", yes_price_dollars=price))
+    _, fills, counts = _mrun(fake, mode="dry_run")
+    assert fills == [] and counts["fill_unreadable"] == 1 and counts["fills"] == 0
+
+
+# I3: a confirmed taker fill halts the maker (persisted) until the flag is removed by hand
+def test_taker_fill_halts_quoting_until_flag_removed_by_hand():
+    fake = _mfake()
+    state, seen = MakerState(), set()
+    first, _, _ = _mrun(fake, state=state, seen=seen)
+    fake.fill_resting(first[0]["order_id"], 5, ts=RUN_NOW + pd.Timedelta(minutes=1), is_taker=True)
+    fake.calls.clear()
+    quotes, fills, counts = _mrun(fake, now=LATER, state=state, seen=seen)
+    assert fills[0]["is_taker"] is True and counts["taker_fill"] == 1
+    assert quotes == [] and not _creates(fake) and counts["halted"] == 1
+    assert len([c for c in fake.calls if c[0] == "cancel"]) == 1   # housekeeping still cancels
+    assert state.halted and state.halted_at == LATER
+    blob = state.to_json()
+    back = MakerState.from_json(blob)
+    assert back.halted and back.to_json() == blob
+    quotes, _, counts = _mrun(fake, now=LATER + pd.Timedelta(minutes=15), state=back, seen=seen)
+    assert quotes == [] and not _creates(fake) and counts["halted"] == 1
+    doc = json.loads(blob)
+    del doc["halted"]                                                # removed by hand
+    cleared = MakerState.from_json(json.dumps(doc))
+    assert not cleared.halted
+    quotes, _, _ = _mrun(fake, now=LATER + pd.Timedelta(minutes=30), state=cleared, seen=seen)
+    assert quotes and {r["status"] for r in quotes} == {"placed"}
+
+
+def test_plan_quotes_places_nothing_while_halted():
+    state = MakerState()
+    state.halt(NOW)
+    quotes, skips, _ = _plan([_ev("E1"), _ev("E2")], state=state)
+    assert quotes == [] and skips == {"halted": 1}
+
+
+# I6: an order resting without an expiry is cancelled at once and logged
+def test_order_without_expiry_is_cancelled_and_logged_no_expiry():
+    fake = _mfake()
+    fake.honor_expiry = False
+    quotes, _, counts = _mrun(fake)
+    placed_ids = {r["order_id"] for r in quotes if r["status"] == "placed"}
+    assert len(placed_ids) == 2 and not fake.get_orders(status="resting")
+    errs = [r for r in quotes if r["status"] == "error"]
+    assert {r["order_id"] for r in errs} == placed_ids
+    assert all(r["error"] == "no_expiry" and set(r) == set(QUOTE_COLUMNS) for r in errs)
+    assert counts["no_expiry"] == 2 and counts["placed"] == 2 and counts["cancelled"] == 2
+
+
+@pytest.mark.parametrize("field", ["expiration_time", "expiration_ts"])
+def test_orders_with_expiry_are_left_resting(field):
+    fake = _mfake()
+    fake.expiry_field = field
+    quotes, _, counts = _mrun(fake)
+    assert len(fake.get_orders(status="resting")) == 2 and counts["no_expiry"] == 0
+    assert {r["status"] for r in quotes} == {"placed"}
+
+
+# minors: non-finite positions and ticker-less cancel failures fail closed
+@pytest.mark.parametrize("pos", ["nan", "inf", "-inf"])
+def test_non_finite_position_fails_closed(pos):
+    fake = _mfake(positions=[{"ticker": DUC, "position_fp": pos}])
+    quotes, _, counts = _mrun(fake)
+    assert [r["market_ticker"] for r in quotes] == [SON]
+    assert counts["position_cap"] == 1
+
+
+def test_cancel_failure_on_order_without_ticker_blocks_every_market():
+    fake = _mfake(orders=[{"order_id": "x1", "client_order_id": "atpedge-mk-zzz-1",
+                           "status": "resting", "fill_count_fp": "0.00"}], fail_cancel={"x1"})
+    quotes, _, counts = _mrun(fake)
+    assert not _creates(fake)
+    assert len(quotes) == 2 and {r["status"] for r in quotes} == {"cancel_failed"}
+    assert all(r["error"] for r in quotes) and counts["cancel_failed"] == 2

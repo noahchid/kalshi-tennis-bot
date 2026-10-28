@@ -55,6 +55,9 @@ class FakeKalshi:
     cancel and fills read is appended to `calls` in order. Like Kalshi, the
     balance excludes the collateral of resting orders placed here
     (price x unfilled count), until they fill or are cancelled.
+    A resting order keeps the expiration it was sent under `expiry_field`
+    unless `honor_expiry` is False (an endpoint that ignores the field).
+    `order_queries` records the event ticker of every per-event orders read.
     """
 
     def __init__(self, markets=None, cash=500.0, positions=None, orders=None,
@@ -75,6 +78,9 @@ class FakeKalshi:
         self.cancelled = []
         self.calls = []
         self._collateral_ids = set()  # resting orders created here hold collateral
+        self.honor_expiry = True
+        self.expiry_field = "expiration_time"
+        self.order_queries = []
 
     def list_markets(self, series_ticker, status="open", min_close_ts=None):
         return [m for m in self.markets if m["event_ticker"].startswith(series_ticker + "-")]
@@ -90,6 +96,8 @@ class FakeKalshi:
                 if event_ticker is None or p["ticker"].startswith(event_ticker + "-")]
 
     def get_orders(self, event_ticker=None, status=None):
+        if event_ticker is not None:
+            self.order_queries.append(event_ticker)
         return [o for o in self.orders
                 if (event_ticker is None or o["ticker"].startswith(event_ticker + "-"))
                 and (status is None or o["status"] == status)]
@@ -132,6 +140,8 @@ class FakeKalshi:
                                 "client_order_id": client_order_id, "status": "resting",
                                 "yes_price_dollars": f"{price:.4f}", "count": count,
                                 "fill_count_fp": "0.00"})
+            if self.honor_expiry and expiration_time is not None:
+                self.orders[-1][self.expiry_field] = expiration_time
             self._collateral_ids.add(order_id)
             return {"order_id": order_id, "client_order_id": client_order_id,
                     "status": "resting", "fill_count": "0.00", "remaining_count": f"{count:.2f}"}

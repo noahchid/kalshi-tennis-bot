@@ -330,6 +330,8 @@ class _FakeStore:
         self.fail_puts = 0  # fail this many puts with a 409 before succeeding
         self.fail_paths = {}  # path -> fail this many puts of that path with a 409
         self.conflict_writes = {}  # path -> bytes a concurrent writer lands at the conflict
+        self.error_paths = {}  # path -> HTTP status every put of that path fails with
+        self.attempts = []  # every put attempted, in order (incl. failed ones)
         self.branch_ok = True
 
     def check_branch(self):
@@ -343,6 +345,9 @@ class _FakeStore:
 
     def put(self, path, data, sha, message):
         from kalshi_bot.state import StateError
+        self.attempts.append(path)
+        if path in self.error_paths:
+            raise StateError(f"writing {path} failed", self.error_paths[path])
         if self.fail_puts:
             self.fail_puts -= 1
             raise StateError(f"writing {path} failed", 409)
@@ -587,8 +592,8 @@ def test_maker_policy_places_quotes_and_shadows_taker_once_per_event(monkeypatch
     log = _read_parquet_file(store, "kalshi_bets.parquet")
     assert list(log.status) == ["shadow"] and list(log.run_mode) == ["shadow"]
     assert log.contracts.iloc[0] == 106
-    state = json.loads(store.files["kalshi_maker_state.json"])
-    assert set(state["first_mid"]) == {"KXATPMATCH-26SEP23DUCSON"}
+    state = json.loads(store.files["kalshi_maker_state.json"])  # one state per env
+    assert set(state) == {"demo"} and set(state["demo"]["first_mid"]) == {"KXATPMATCH-26SEP23DUCSON"}
 
 
 def test_maker_policy_fills_recorded_once_and_seen_rebuilt_from_store(monkeypatch, tmp_path):
@@ -677,8 +682,10 @@ def test_maker_state_push_conflict_rereads_remote_and_retries_once(monkeypatch, 
         merged = _read_parquet_file(store, path)
         assert list(merged.status) == ["placed"] * 3  # remote row kept, this run's two re-appended
         assert merged.market_ticker.iloc[0] == "KXATPMATCH-26SEP20AAABBB-AAA"
-    else:
-        assert set(json.loads(store.files[path])["first_mid"]) == {"KXATPMATCH-26SEP23DUCSON"}
+    else:  # the remote (pre-env shape = prod) state is kept; this run's demo state is merged in
+        doc = json.loads(store.files[path])
+        assert doc["prod"] == {"first_mid": {}, "retired": {}}
+        assert set(doc["demo"]["first_mid"]) == {"KXATPMATCH-26SEP23DUCSON"}
 
 
 def test_maker_error_row_does_not_fail_run(monkeypatch, tmp_path):
@@ -724,8 +731,26 @@ def test_dedupe_shadow_quotes_keeps_first_per_market_per_utc_day():
 def test_workflow_passes_policy_env():
     from pathlib import Path
     wf = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "bot.yml").read_text()
-    assert "BOT_POLICY: ${{ vars.BOT_POLICY || 'taker' }}" in wf
+    assert "BOT_POLICY: ${{ github.event.inputs.bot_policy || vars.BOT_POLICY || 'taker' }}" in wf
+    assert "KALSHI_ENV: ${{ github.event.inputs.kalshi_env || vars.KALSHI_ENV || 'demo' }}" in wf
     assert "MAKER_STOP_HOURS: ${{ vars.MAKER_STOP_HOURS || '4' }}" in wf
+    assert """KALSHI_ENV="$(printf '%s' "$KALSHI_ENV" | tr '[:upper:]' '[:lower:]')\"""" in wf
+
+
+def test_workflow_dispatch_offers_policy_and_demo_only_env():
+    from pathlib import Path
+    wf = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "bot.yml").read_text()
+    dispatch = wf.split("workflow_dispatch:")[1].split("concurrency:")[0]
+    import re
+    blocks = {}
+    for chunk in re.split(r"\n      (?=\w)", dispatch)[1:]:  # one chunk per input (6-space indent)
+        name, _, body = chunk.partition(":")
+        blocks[name.strip()] = body
+    assert "type: choice" in blocks["bot_policy"]
+    assert "options: ['', 'taker', 'maker']" in blocks["bot_policy"] and "default: ''" in blocks["bot_policy"]
+    assert "type: choice" in blocks["kalshi_env"]
+    # demo only: a manual run can never switch prod on
+    assert "options: ['', 'demo']" in blocks["kalshi_env"] and "default: ''" in blocks["kalshi_env"]
 
 
 def test_maker_policy_shadow_taker_sized_before_maker_bids_reserve_cash(monkeypatch, tmp_path):
@@ -762,3 +787,166 @@ def test_maker_policy_shadow_taker_exception_still_quotes_and_exits_1(monkeypatc
     out = capsys.readouterr().out
     assert "taker (shadow) failed: RuntimeError" in out and "maker (live): placed 2" in out
     assert "KXATP" not in out and "Duckworth" not in out
+
+
+# ── final-review fixes ───────────────────────────────────────────────────────
+
+def _env(monkeypatch, env):
+    import kalshi_bot.bettor as bettor_mod
+    monkeypatch.setattr(bettor_mod, "KALSHI_ENV", env)
+
+
+# I1: a demo run reads and writes only its own MakerState, and tags its fills
+def test_demo_run_keeps_prod_maker_state_and_tags_fills(monkeypatch, tmp_path):
+    _env(monkeypatch, "demo")
+    ev = "KXATPMATCH-26SEP23DUCSON"
+    # Prod's (pre-env shape) first mids would retire this event at demo's 0.445 / 0.565 mids.
+    prod_doc = {"first_mid": {ev: {ev + "-DUC": 0.30, ev + "-SON": 0.70}}, "retired": {"OTHER": "x"}}
+    store = _FakeStore({"plays.json": _plays_bytes(),
+                        "kalshi_maker_state.json": json.dumps(prod_doc).encode()})
+    fake = _fake()
+    assert _main(monkeypatch, tmp_path, store, fake, policy="maker") == 0
+    assert len(fake.placed) == 2
+    duc = next(o["order_id"] for o in fake.orders if o["ticker"].endswith("-DUC"))
+    fake.fill_resting(duc, 2, ts=NOW + pd.Timedelta(minutes=3))
+    assert _main(monkeypatch, tmp_path, store, fake, policy="maker", now=NOW + pd.Timedelta(minutes=15)) == 0
+    doc = json.loads(store.files["kalshi_maker_state.json"])
+    assert doc["prod"] == prod_doc
+    assert doc["demo"]["first_mid"][ev][ev + "-DUC"] == pytest.approx(0.445)
+    assert list(_read_parquet_file(store, "kalshi_maker_fills.parquet").kalshi_env) == ["demo"]
+
+
+# I2: every maker state file is pushed even when an earlier one fails
+def test_maker_push_failure_still_pushes_other_files_and_exits_1(monkeypatch, tmp_path, capsys):
+    store, fake = _FakeStore({"plays.json": _plays_bytes()}), _fake()
+    assert _main(monkeypatch, tmp_path, store, fake, policy="maker") == 0
+    duc = next(o["order_id"] for o in fake.orders if o["ticker"].endswith("-DUC"))
+    fake.fill_resting(duc, 2, ts=NOW + pd.Timedelta(minutes=3))
+    store.attempts.clear()
+    store.error_paths["kalshi_quotes.parquet"] = 502
+    store.files["kalshi_maker_state.json"] = b'{"first_mid": {}, "retired": {}}'  # forces a state push
+    assert _main(monkeypatch, tmp_path, store, fake, policy="maker", now=NOW + pd.Timedelta(minutes=15)) == 1
+    maker_files = [p for p in store.attempts if p.startswith("kalshi_maker") or p == "kalshi_quotes.parquet"]
+    assert maker_files == ["kalshi_maker_state.json", "kalshi_quotes.parquet", "kalshi_maker_fills.parquet"]
+    assert store.files["kalshi_maker_state.json"] != b'{"first_mid": {}, "retired": {}}'
+    assert len(_read_parquet_file(store, "kalshi_maker_fills.parquet")) == 1
+    assert "HTTP 502" in capsys.readouterr().out
+
+
+# I3: fills are classified by the bot's own logged order ids when Kalshi's order history has a gap
+def test_maker_fill_classified_from_logged_quotes_when_order_history_is_missing(monkeypatch, tmp_path):
+    class HistoryGap(FakeKalshi):
+        def get_orders(self, event_ticker=None, status=None):
+            if event_ticker is not None:
+                self.order_queries.append(event_ticker)
+                return []
+            return super().get_orders(status=status)
+
+    markets = make_event("KXATPMATCH", "26SEP23", "James Duckworth", "Lorenzo Sonego",
+                         ask1=0.45, ask2=0.57, occurrence="2026-09-24T06:00:00Z")
+    store, fake = _FakeStore({"plays.json": _plays_bytes()}), HistoryGap(markets=markets, cash=1000.0)
+    _main(monkeypatch, tmp_path, store, fake, policy="maker")
+    duc = next(o["order_id"] for o in fake.orders if o["ticker"].endswith("-DUC"))
+    fake.fill_resting(duc, 2, ts=NOW + pd.Timedelta(minutes=3))  # the fill carries no client_order_id
+    assert _main(monkeypatch, tmp_path, store, fake, policy="maker", now=NOW + pd.Timedelta(minutes=15)) == 0
+    fills = _read_parquet_file(store, "kalshi_maker_fills.parquet")
+    assert list(fills.order_id) == [duc] and fills.client_order_id.iloc[0].startswith("atpedge-mk-")
+    assert fake.order_queries == []
+
+
+# I3: a taker fill halts the maker in the persisted state for that env
+def test_taker_fill_halt_persists_across_runs(monkeypatch, tmp_path, capsys):
+    _env(monkeypatch, "demo")
+    store, fake = _FakeStore({"plays.json": _plays_bytes()}), _fake()
+    _main(monkeypatch, tmp_path, store, fake, policy="maker")
+    duc = next(o["order_id"] for o in fake.orders if o["ticker"].endswith("-DUC"))
+    fake.fill_resting(duc, 5, ts=NOW + pd.Timedelta(minutes=3), is_taker=True)
+    _main(monkeypatch, tmp_path, store, fake, policy="maker", now=NOW + pd.Timedelta(minutes=15))
+    assert json.loads(store.files["kalshi_maker_state.json"])["demo"]["halted"]
+    n_placed = len(fake.placed)
+    capsys.readouterr()
+    _main(monkeypatch, tmp_path, store, fake, policy="maker", now=NOW + pd.Timedelta(minutes=30))
+    assert len(fake.placed) == n_placed
+    out = capsys.readouterr().out
+    assert "halted 1" in out and "skipped {" not in out.split("maker (live):")[1].split("\n")[0]
+
+
+# I5: maker fill tickers count toward the bankroll in both fetch_bankroll calls
+@pytest.mark.parametrize("policy", ["taker", "maker"])
+def test_maker_fill_tickers_count_in_both_bankrolls(monkeypatch, tmp_path, policy):
+    import io
+    import kalshi_bot.bettor as bettor_mod
+    _env(monkeypatch, "demo")
+    lost = "KXATPMATCH-26SEP20AAABBB-AAA"
+    fills = pd.DataFrame([{"fill_id": "f1", "market_ticker": lost, "kalshi_env": "demo", "count": 5.0},
+                          {"fill_id": "f2", "market_ticker": "KXATPMATCH-26SEP20CCCDDD-CCC",
+                           "kalshi_env": "prod", "count": 5.0}])
+    buf = io.BytesIO()
+    fills.to_parquet(buf, index=False)
+    store = _FakeStore({"plays.json": _plays_bytes(), "kalshi_maker_fills.parquet": buf.getvalue()})
+    # Kalshi's order history does not list the maker order; the settlement is a $100 loss.
+    fake = _fake(settlements=[{"ticker": lost, "revenue": 0, "yes_total_cost_dollars": "100.00",
+                               "no_total_cost_dollars": "0", "fee_cost": "0"}])
+    seen = []
+    real = bettor_mod.fetch_bankroll
+
+    def spy(*a, **kw):
+        seen.append(set(kw.get("extra_bot_tickers", ())))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(bettor_mod, "fetch_bankroll", spy)
+    _main(monkeypatch, tmp_path, store, fake, policy=policy)
+    assert seen == [{lost}, {lost}]
+    assert json.loads(store.files["kalshi_bankroll.json"])["bankroll"] == pytest.approx(900.0)
+
+
+# I6: cancel-only maker housekeeping on BETTING_MODE=off (with credentials) and on unusable plays
+def _resting_fake():
+    fake = _fake(orders=[
+        {"order_id": "mk1", "ticker": "KXATPMATCH-26SEP23DUCSON-DUC", "status": "resting",
+         "client_order_id": "atpedge-mk-aaa-1", "fill_count_fp": "0.00"},
+        {"order_id": "tk1", "ticker": "KXATPMATCH-26SEP23DUCSON-SON", "status": "resting",
+         "client_order_id": "manual-1", "fill_count_fp": "0.00"}])
+    return fake
+
+
+@pytest.mark.parametrize("policy", ["taker", "maker"])
+def test_off_with_credentials_cancels_resting_maker_orders_only(monkeypatch, tmp_path, capsys, policy):
+    import kalshi_bot.bettor as bettor_mod
+
+    class NoStore:
+        def __getattr__(self, name):
+            raise AssertionError("BETTING_MODE=off must not touch the state repo")
+
+    monkeypatch.setattr(bettor_mod, "KALSHI_API_KEY_ID", "key")
+    monkeypatch.setattr(bettor_mod, "KALSHI_PRIVATE_KEY_PATH", "/x/kalshi.pem")
+    fake = _resting_fake()
+    assert _main(monkeypatch, tmp_path, NoStore(), fake, mode="off", policy=policy) == 0
+    assert fake.cancelled == ["mk1"] and fake.placed == []
+    out = capsys.readouterr().out
+    assert "cancelled 1" in out and "atpedge" not in out and "KXATP" not in out
+
+
+def test_off_without_credentials_keeps_early_return(monkeypatch, tmp_path):
+    import kalshi_bot.bettor as bettor_mod
+    monkeypatch.setattr(bettor_mod, "KALSHI_API_KEY_ID", "")
+    monkeypatch.setattr(bettor_mod, "KALSHI_PRIVATE_KEY_PATH", "")
+    fake = _resting_fake()
+    assert _main(monkeypatch, tmp_path, _FakeStore(), fake, mode="off") == 0
+    assert fake.cancelled == [] and fake.calls == []
+
+
+@pytest.mark.parametrize("plays", ["stale", "missing"])
+def test_live_with_unusable_plays_still_cancels_resting_maker_orders(monkeypatch, tmp_path, capsys, plays):
+    files = {"plays.json": _plays_bytes(generated_at="2026-09-21T00:00:00Z")} if plays == "stale" else {}
+    store, fake = _FakeStore(files), _resting_fake()
+    assert _main(monkeypatch, tmp_path, store, fake, mode="live") == 0
+    assert fake.cancelled == ["mk1"] and fake.placed == [] and store.puts == []
+    assert "cancelled 1" in capsys.readouterr().out
+
+
+def test_dry_run_with_stale_plays_cancels_nothing(monkeypatch, tmp_path):
+    store = _FakeStore({"plays.json": _plays_bytes(generated_at="2026-09-21T00:00:00Z")})
+    fake = _resting_fake()
+    assert _main(monkeypatch, tmp_path, store, fake, mode="dry_run") == 0
+    assert fake.cancelled == []

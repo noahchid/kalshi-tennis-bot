@@ -68,8 +68,10 @@ def _logged_bot_tickers(bet_log: pd.DataFrame | None, env: str) -> set[str]:
 
 
 def fetch_bankroll(client, start_bankroll: float, bet_log: pd.DataFrame | None = None,
-                   env: str = KALSHI_ENV) -> BankrollState:
+                   env: str = KALSHI_ENV, extra_bot_tickers=()) -> BankrollState:
+    """extra_bot_tickers: further bot markets (the maker's filled markets), unioned with
+    the bet log's filled taker markets as a backup to Kalshi's order history."""
     cash = client.get_balance(exchange_index=KALSHI_TENNIS_EXCHANGE_INDEX)
     start = start_bankroll if start_bankroll > 0 else cash
     return compute_bankroll(start, client.get_orders(), client.get_settlements(), client.get_positions(),
-                            cash, extra_bot_tickers=_logged_bot_tickers(bet_log, env))
+                            cash, extra_bot_tickers=_logged_bot_tickers(bet_log, env) | set(extra_bot_tickers))

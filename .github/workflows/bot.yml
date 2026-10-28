@@ -13,6 +13,16 @@ on:
         type: choice
         options: ['', 'off', 'dry_run', 'live']
         default: ''
+      bot_policy:
+        description: 'Override BOT_POLICY for this run (blank = repo variable)'
+        type: choice
+        options: ['', 'taker', 'maker']
+        default: ''
+      kalshi_env:
+        description: 'Run this one against DEMO (blank = repo variable); a manual run can never select prod'
+        type: choice
+        options: ['', 'demo']
+        default: ''
       kalshi_probe:
         description: 'Only run the DEMO order-path probe'
         type: boolean
@@ -45,9 +55,9 @@ jobs:
       - name: Bet
         if: github.event.inputs.kalshi_probe != 'true'
         env:
-          KALSHI_ENV: ${{ vars.KALSHI_ENV || 'demo' }}
+          KALSHI_ENV: ${{ github.event.inputs.kalshi_env || vars.KALSHI_ENV || 'demo' }}
           BETTING_MODE: ${{ github.event.inputs.betting_mode || vars.BETTING_MODE || 'dry_run' }}
-          BOT_POLICY: ${{ vars.BOT_POLICY || 'taker' }}
+          BOT_POLICY: ${{ github.event.inputs.bot_policy || vars.BOT_POLICY || 'taker' }}
           MAKER_STOP_HOURS: ${{ vars.MAKER_STOP_HOURS || '4' }}
           # Secrets, not vars: step env values from vars print in public logs.
           KALSHI_START_BANKROLL: ${{ secrets.KALSHI_START_BANKROLL }}

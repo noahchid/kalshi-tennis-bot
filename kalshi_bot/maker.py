@@ -44,11 +44,29 @@ class Quote:
 
 
 class MakerState:
-    """First-seen mid per market and the set of retired events; persisted as JSON."""
+    """One env's maker state: first-seen mid per market, the retired events and the
+    halt flag; persisted as JSON (see load_env_state / store_env_state for the file).
+
+    The halt flag is set when a maker fill took liquidity (is_taker true). While it is
+    set nothing is quoted; it is cleared only by hand, by deleting "halted" from the file.
+    """
 
     def __init__(self) -> None:
         self._first_mid: dict[str, dict[str, float]] = {}
         self._retired: dict[str, str] = {}
+        self._halted: str | None = None
+
+    @property
+    def halted(self) -> bool:
+        return self._halted is not None
+
+    @property
+    def halted_at(self) -> pd.Timestamp | None:
+        return None if self._halted is None else pd.Timestamp(self._halted)
+
+    def halt(self, at: pd.Timestamp) -> None:
+        if self._halted is None:
+            self._halted = pd.Timestamp(at).isoformat()
 
     def first_mid(self, event: str, market: str) -> float | None:
         return self._first_mid.get(event, {}).get(market)
@@ -62,22 +80,56 @@ class MakerState:
     def retire(self, event: str, at: pd.Timestamp) -> None:
         self._retired[event] = pd.Timestamp(at).isoformat()
 
+    def _doc(self) -> dict:
+        doc = {"first_mid": self._first_mid, "retired": self._retired}
+        if self._halted is not None:
+            doc["halted"] = self._halted
+        return doc
+
     def to_json(self) -> bytes:
-        return json.dumps(
-            {"first_mid": self._first_mid, "retired": self._retired}, sort_keys=True
-        ).encode()
+        return json.dumps(self._doc(), sort_keys=True).encode()
+
+    @classmethod
+    def _from_doc(cls, data: dict) -> "MakerState":
+        state = cls()
+        state._first_mid = {
+            ev: {mk: float(v) for mk, v in mids.items()} for ev, mids in (data.get("first_mid") or {}).items()
+        }
+        state._retired = {ev: str(at) for ev, at in (data.get("retired") or {}).items()}
+        halted = data.get("halted")
+        state._halted = str(halted) if halted else None
+        return state
 
     @classmethod
     def from_json(cls, raw: bytes | str | None) -> "MakerState":
-        state = cls()
-        if not raw:
-            return state
-        data = json.loads(raw)
-        state._first_mid = {
-            ev: {mk: float(v) for mk, v in mids.items()} for ev, mids in data.get("first_mid", {}).items()
-        }
-        state._retired = {ev: str(at) for ev, at in data.get("retired", {}).items()}
-        return state
+        return cls._from_doc(json.loads(raw)) if raw else cls()
+
+
+_STATE_KEYS = ("first_mid", "retired", "halted")
+
+
+def _env_docs(raw: bytes | str | None) -> dict[str, dict]:
+    """The state file as {env: state doc}. The pre-env file (one state at the top
+    level, written before demo runs were tagged) is prod's state."""
+    if not raw:
+        return {}
+    data = json.loads(raw)
+    if any(k in data for k in _STATE_KEYS):
+        return {"prod": data}
+    return dict(data)
+
+
+def load_env_state(raw: bytes | str | None, env: str) -> MakerState:
+    """This env's MakerState from the state file (fresh when the env has none)."""
+    doc = _env_docs(raw).get(env)
+    return MakerState._from_doc(doc) if doc else MakerState()
+
+
+def store_env_state(raw: bytes | str | None, env: str, state: MakerState) -> bytes:
+    """The state file with this env's state replaced; other envs are kept as they are."""
+    docs = _env_docs(raw)
+    docs[env] = state._doc()
+    return json.dumps(docs, sort_keys=True).encode()
 
 
 def _book_extreme(book: Book) -> bool:
@@ -112,9 +164,13 @@ def plan_quotes(
     Event-level reasons (retired, no_start_time, too_close_to_start, retire_move)
     count once per event; market-level reasons (book_extreme, wide_spread,
     position_cap, budget) count once per market. Mutates `state`: records first
-    mids (only for events that get a quote) and retires events.
+    mids (only for events that get a quote) and retires events. A halted state
+    plans nothing (reason "halted", counted once).
     """
     skips: Counter = Counter()
+    if state.halted:  # a maker fill took liquidity: nothing until the flag is cleared by hand
+        skips["halted"] += 1
+        return [], skips
     candidates: list[Quote] = []
     by_event: dict[str, EventBooks] = {}
     stop = pd.Timedelta(hours=stop_hours)
@@ -199,7 +255,7 @@ QUOTE_COLUMNS = [
 ]
 FILL_COLUMNS = [
     "fill_id", "fill_ts", "market_ticker", "event_ticker", "order_id", "client_order_id",
-    "price", "count", "fee", "is_taker",
+    "price", "count", "fee", "is_taker", "kalshi_env",
 ]
 MAKER_MODES = ("live", "dry_run", "shadow")
 _PLACE_STATUS = {"live": "placed", "dry_run": "dry_run", "shadow": "shadow_quote"}
@@ -238,10 +294,21 @@ def _fill_ts(fill: dict) -> pd.Timestamp | None:
         return None
 
 
-def _is_taker(v) -> bool:
-    if isinstance(v, str):
+def _is_taker(v) -> bool | None:
+    """True/False when the fill says so; None when the field is missing or unreadable."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str) and v.strip().lower() in ("true", "false"):
         return v.strip().lower() == "true"
-    return bool(v)
+    if isinstance(v, (int, float)) and v in (0, 1):
+        return bool(v)
+    return None
+
+
+def _unit_price(v) -> float | None:
+    """A price in dollars strictly inside (0, 1); None otherwise (e.g. a value in cents)."""
+    x = _num(v)
+    return x if x is not None and math.isfinite(x) and 0 < x < 1 else None
 
 
 def _event_of(market_ticker: str) -> str:
@@ -252,16 +319,21 @@ def _error_text(e: Exception) -> str:
     return str(e) if isinstance(e, KalshiAPIError) else repr(e)
 
 
-def _reconcile_fills(client, fills_seen: set[str], now: pd.Timestamp,
-                     counts: Counter) -> list[dict]:
+def _reconcile_fills(client, fills_seen: set[str], now: pd.Timestamp, counts: Counter,
+                     placed_orders: dict[str, str], kalshi_env: str) -> list[dict]:
     """New fills of maker orders, deduped by fill id against (and added to) fills_seen.
 
     Kalshi's /portfolio/fills field names are unverified; each is read with a
     fallback: id fill_id|trade_id, time created_time|ts, ticker ticker|market_ticker,
     price yes_price_dollars|price (dollars), count count_fp|count, fee fee_cost|fees
-    (total dollars for the fill). A fill is a maker fill when its order's
-    client_order_id has MAKER_ORDER_PREFIX: taken from the fill when present,
-    else looked up by order_id among that event's orders.
+    (total dollars for the fill). A fill is a maker fill when its order is one the
+    bot logged as placed (`placed_orders`: order_id -> client_order_id), else when
+    its client_order_id has MAKER_ORDER_PREFIX: taken from the fill when present,
+    else looked up by order_id among that event's orders (read once per event per run).
+
+    A maker fill whose price is not strictly inside (0, 1) dollars counts as
+    fill_unreadable and is not stored. A missing is_taker is stored as None
+    (taker_unknown), never as False.
     """
     out: list[dict] = []
     orders_by_event: dict[str, dict[str, str]] = {}
@@ -277,7 +349,8 @@ def _reconcile_fills(client, fills_seen: set[str], now: pd.Timestamp,
             continue
         event = str(_first(fill, "event_ticker") or _event_of(market))
         order_id = fill.get("order_id")
-        coid = fill.get("client_order_id")
+        coid = placed_orders.get(str(order_id)) if order_id is not None else None
+        coid = coid or fill.get("client_order_id")
         if not coid:
             if event not in orders_by_event:
                 orders_by_event[event] = {
@@ -292,8 +365,14 @@ def _reconcile_fills(client, fills_seen: set[str], now: pd.Timestamp,
         fills_seen.add(fill_id)
         if not str(coid).startswith(MAKER_ORDER_PREFIX):
             continue
+        price = _unit_price(_first(fill, "yes_price_dollars", "price"))
+        if price is None:
+            counts["fill_unreadable"] += 1
+            continue
         taker = _is_taker(fill.get("is_taker"))
-        if taker:
+        if taker is None:
+            counts["taker_unknown"] += 1
+        elif taker:
             counts["taker_fill"] += 1
         counts["fills"] += 1
         out.append({
@@ -303,27 +382,79 @@ def _reconcile_fills(client, fills_seen: set[str], now: pd.Timestamp,
             "event_ticker": event,
             "order_id": order_id,
             "client_order_id": str(coid),
-            "price": _num(_first(fill, "yes_price_dollars", "price")),
+            "price": price,
             "count": _num(_first(fill, "count_fp", "count")),
             "fee": _num(_first(fill, "fee_cost", "fees")),
             "is_taker": taker,
+            "kalshi_env": kalshi_env,
         })
     return out
 
 
+# Key in _cancel_stale's result for a failed cancel whose order has no ticker:
+# its market is unknown, so no market may be quoted that run.
+_ANY_MARKET = "*"
+
+
+def _is_maker_order(o: dict) -> bool:
+    return str(o.get("client_order_id") or "").startswith(MAKER_ORDER_PREFIX)
+
+
 def _cancel_stale(client, counts: Counter) -> dict[str, str]:
-    """Cancel every resting maker order; returns {market_ticker: error} for failed cancels."""
+    """Cancel every resting maker order; returns {market_ticker: error} for failed
+    cancels (key _ANY_MARKET when the failed order carries no ticker)."""
     failed: dict[str, str] = {}
     for o in client.get_orders(status="resting"):
-        if not str(o.get("client_order_id") or "").startswith(MAKER_ORDER_PREFIX):
+        if not _is_maker_order(o):
             continue
         try:
             client.cancel_order(o["order_id"])
             counts["cancelled"] += 1
         except Exception as e:  # incl. "already filled / not found": unknown state, hands off
             counts["cancel_errors"] += 1
-            failed[str(o.get("ticker"))] = _error_text(e)
+            failed[str(o.get("ticker") or _ANY_MARKET)] = _error_text(e)
     return failed
+
+
+def cancel_resting_maker_orders(client) -> Counter:
+    """Cancel-only maker housekeeping (BETTING_MODE=off, or a run with no usable plays):
+    cancels every resting atpedge-mk- order, reconciles nothing. Counts only."""
+    counts: Counter = Counter()
+    _cancel_stale(client, counts)
+    return counts
+
+
+def _has_expiry(o: dict) -> bool:
+    return any(o.get(k) not in (None, "", 0) for k in ("expiration_time", "expiration_ts"))
+
+
+def _cancel_unexpiring(client, rows: list[dict], now: pd.Timestamp, mode: str, kalshi_env: str,
+                       counts: Counter) -> list[dict]:
+    """Read back resting maker orders and cancel any without an expiry (an endpoint that
+    ignored expiration_time would leave a plain GTC bid). One `error` row ("no_expiry")
+    per such order."""
+    by_order = {r["order_id"]: r for r in rows if r.get("order_id")}
+    out = []
+    for o in client.get_orders(status="resting"):
+        if not _is_maker_order(o) or _has_expiry(o):
+            continue
+        counts["no_expiry"] += 1
+        error = "no_expiry"
+        try:
+            client.cancel_order(o["order_id"])
+            counts["cancelled"] += 1
+        except Exception as e:
+            counts["cancel_errors"] += 1
+            error = f"no_expiry; cancel failed: {_error_text(e)}"
+        base = by_order.get(o.get("order_id"))
+        if base is None:
+            market = str(o.get("ticker") or "")
+            base = {c: None for c in QUOTE_COLUMNS}
+            base.update(policy="maker", mode=mode, kalshi_env=kalshi_env, market_ticker=market or None,
+                        event_ticker=_event_of(market) if market else None, order_id=o.get("order_id"),
+                        client_order_id=o.get("client_order_id"))
+        out.append(dict(base, logged_at=now, status="error", error=error))
+    return out
 
 
 def _positions(client) -> dict[str, float]:
@@ -332,20 +463,26 @@ def _positions(client) -> dict[str, float]:
     for p in client.get_positions():
         pos = get_position_fp(p)
         try:
-            out[p["ticker"]] = abs(float(pos))
+            n = abs(float(pos))
         except (TypeError, ValueError):
-            out[p["ticker"]] = math.inf
+            n = math.inf
+        out[p["ticker"]] = n if math.isfinite(n) else math.inf
     return out
 
 
 def run_maker(mode: str, client, plays, state: MakerState, fills_seen: set[str],
               bankroll: float, now, kalshi_env: str, housekeeping: bool,
+              placed_orders: dict[str, str] | None = None,
               ) -> tuple[list[dict], list[dict], Counter]:
     """One maker run: (quote rows, new fill rows, counts).
 
     housekeeping=True reconciles maker fills and cancels every resting maker
     order first, in any mode. Only mode "live" places orders; "dry_run" and
-    "shadow" log the quotes they would post. Prints nothing.
+    "shadow" log the quotes they would post. A reconciled maker fill with
+    is_taker true halts `state` (persisted), and a halted state quotes nothing.
+    After placing, resting maker orders without an expiry are cancelled
+    ("no_expiry" error rows). `placed_orders` (order_id -> client_order_id of the
+    bot's own placed quotes) classifies fills before any order lookup. Prints nothing.
     """
     if mode not in MAKER_MODES:
         raise ValueError(f"invalid maker mode: {mode!r}")
@@ -359,7 +496,9 @@ def run_maker(mode: str, client, plays, state: MakerState, fills_seen: set[str],
     fills: list[dict] = []
     cancel_failed: dict[str, str] = {}
     if housekeeping:
-        fills = _reconcile_fills(client, fills_seen, now, counts)
+        fills = _reconcile_fills(client, fills_seen, now, counts, placed_orders or {}, kalshi_env)
+        if any(f["is_taker"] is True for f in fills):
+            state.halt(now)
         cancel_failed = _cancel_stale(client, counts)
 
     index = index_open_markets({lvl: client.list_markets(series, status="open")
@@ -389,8 +528,9 @@ def run_maker(mode: str, client, plays, state: MakerState, fills_seen: set[str],
             "price": q.price, "count": q.count, "status": None, "error": None,
             "order_id": None, "client_order_id": coid, "expiration_time": expiration,
         }
-        if q.market_ticker in cancel_failed:
-            row.update(status="cancel_failed", error=cancel_failed[q.market_ticker])
+        blocked = cancel_failed.get(q.market_ticker) or cancel_failed.get(_ANY_MARKET)
+        if blocked:
+            row.update(status="cancel_failed", error=blocked)
         elif mode != "live":
             row["status"] = _PLACE_STATUS[mode]
         else:
@@ -405,4 +545,6 @@ def run_maker(mode: str, client, plays, state: MakerState, fills_seen: set[str],
                 row.update(status="error", error=_error_text(e))
         counts[row["status"]] += 1
         rows.append(row)
+    if mode == "live" and any(r["status"] in ("placed", "error") for r in rows):
+        rows += _cancel_unexpiring(client, rows, now, mode, kalshi_env, counts)
     return rows, fills, counts
