@@ -18,6 +18,8 @@ BET_COLUMNS = [
 ]
 PLACED_STATUSES = {"filled", "partial"}
 EMAIL_STATUSES = {"filled", "partial", "dry_run"}
+# What the taker would have bet while BOT_POLICY=maker: logged, never sent, never emailed.
+SHADOW_STATUSES = {"shadow"}
 
 
 def load_bet_log(path: Path = KALSHI_BETS_PATH) -> pd.DataFrame:

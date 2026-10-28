@@ -328,6 +328,8 @@ class _FakeStore:
         self.puts = []
 
         self.fail_puts = 0  # fail this many puts with a 409 before succeeding
+        self.fail_paths = {}  # path -> fail this many puts of that path with a 409
+        self.conflict_writes = {}  # path -> bytes a concurrent writer lands at the conflict
         self.branch_ok = True
 
     def check_branch(self):
@@ -344,17 +346,23 @@ class _FakeStore:
         if self.fail_puts:
             self.fail_puts -= 1
             raise StateError(f"writing {path} failed", 409)
+        if self.fail_paths.get(path):
+            self.fail_paths[path] -= 1
+            if path in self.conflict_writes:
+                self.files[path] = self.conflict_writes.pop(path)
+            raise StateError(f"writing {path} failed", 409)
         self.puts.append((path, sha))
         self.files[path] = data
         return "new"
 
 
-def _main(monkeypatch, tmp_path, store, client, mode="live"):
+def _main(monkeypatch, tmp_path, store, client, mode="live", policy="taker", now=NOW):
     import kalshi_bot.bettor as bettor_mod
     monkeypatch.setattr(bettor_mod, "KALSHI_BETS_PATH", tmp_path / "kalshi_bets.parquet")
     monkeypatch.setattr(bettor_mod, "KALSHI_BANKROLL_PATH", tmp_path / "kalshi_bankroll.json")
     monkeypatch.setattr(bettor_mod, "KALSHI_START_BANKROLL", 1000.0)
-    return bettor_mod.main(["--mode", mode], store=store, client=client, now=NOW)
+    monkeypatch.setattr(bettor_mod, "BOT_POLICY", policy)
+    return bettor_mod.main(["--mode", mode], store=store, client=client, now=now)
 
 
 def _plays_bytes(**kw):
@@ -367,7 +375,9 @@ def test_main_bets_and_pushes_state(monkeypatch, tmp_path, capsys):
     store, fake = _FakeStore({"plays.json": _plays_bytes()}), _fake()
     assert _main(monkeypatch, tmp_path, store, fake) == 0
     assert len(fake.placed) == 1
-    assert {p for p, _ in store.puts} == {"kalshi_bets.parquet", "kalshi_bankroll.json"}
+    # Taker state, plus the maker shadow's quotes and state (no maker fills yet).
+    assert {p for p, _ in store.puts} == {"kalshi_bets.parquet", "kalshi_bankroll.json",
+                                          "kalshi_quotes.parquet", "kalshi_maker_state.json"}
     out = capsys.readouterr().out
     assert "filled 1" in out and "Duckworth" not in out and "1000" not in out
 
@@ -447,3 +457,272 @@ def test_dry_run_does_not_relog_same_play_each_run(monkeypatch, tmp_path):
     store.puts.clear()
     _main(monkeypatch, tmp_path, store, fake, mode="dry_run")
     assert "kalshi_bets.parquet" not in [p for p, _ in store.puts]
+
+
+# ── run(mode="shadow") ───────────────────────────────────────────────────────
+
+def test_shadow_mode_sizes_and_logs_without_sending_or_consulting_kalshi_guard(tmp_path):
+    class NoGuardKalshi(FakeKalshi):
+        def get_positions(self, event_ticker=None):
+            if event_ticker is not None:
+                raise AssertionError("shadow must not consult Kalshi positions per event")
+            return super().get_positions()
+
+        def get_orders(self, event_ticker=None, status=None):
+            if event_ticker is not None:
+                raise AssertionError("shadow must not consult Kalshi orders per event")
+            return super().get_orders(status=status)
+
+    markets = make_event("KXATPMATCH", "26SEP23", "James Duckworth", "Lorenzo Sonego",
+                         ask1=0.45, ask2=0.57, occurrence="2026-09-24T06:00:00Z")
+    fake = NoGuardKalshi(markets=markets, cash=1000.0)
+    rows, err = _run(fake, [_play("James Duckworth", "Lorenzo Sonego")], tmp_path, mode="shadow")
+    assert not err and fake.placed == [] and fake.calls == []
+    assert rows[0]["status"] == "shadow" and rows[0]["run_mode"] == "shadow"
+    assert rows[0]["contracts"] == 106  # sized exactly like the live taker
+    assert list(load_bet_log(tmp_path / "bets.parquet").status) == ["shadow"]
+
+
+def test_shadow_mode_logs_one_row_per_event_across_runs(tmp_path):
+    fake = _fake()
+    play = [_play("James Duckworth", "Lorenzo Sonego")]
+    _run(fake, play, tmp_path, mode="shadow")
+    rows, _ = _run(fake, play, tmp_path, mode="shadow", now=NOW + pd.Timedelta(minutes=15))
+    assert rows[0]["status"] == "skipped" and rows[0]["skip_reason"] == "bet_log"
+    assert list(load_bet_log(tmp_path / "bets.parquet").status) == ["shadow"]
+
+
+def test_shadow_rows_do_not_block_live_taker_or_dry_run(tmp_path):
+    fake = _fake()
+    play = [_play("James Duckworth", "Lorenzo Sonego")]
+    _run(fake, play, tmp_path, mode="shadow")
+    dry, _ = _run(fake, play, tmp_path, mode="dry_run")
+    live, _ = _run(fake, play, tmp_path, mode="live")
+    assert dry[0]["status"] == "dry_run" and live[0]["status"] == "filled"
+    assert len(fake.placed) == 1
+
+
+def test_shadow_status_is_not_emailed():
+    from kalshi_bot.bet_log import EMAIL_STATUSES, SHADOW_STATUSES
+    assert SHADOW_STATUSES == {"shadow"}
+    assert EMAIL_STATUSES == {"filled", "partial", "dry_run"}
+
+
+# ── main: BOT_POLICY routing ─────────────────────────────────────────────────
+
+def _read_parquet_file(store, path):
+    import io
+    return pd.read_parquet(io.BytesIO(store.files[path]))
+
+
+# Today's (pre-maker) taker output for this fixture, captured from main at 8f20609.
+_GOLDEN_TAKER_ORDER = {
+    "ticker": "KXATPMATCH-26SEP23DUCSON-DUC", "price": 0.45, "count": 106,
+    "client_order_id": "atpedge-61dc372729af-1790164800", "time_in_force": "immediate_or_cancel",
+    "expiration_time": None, "post_only": None, "cancel_order_on_pause": None, "stp": "taker_at_cross",
+}
+_GOLDEN_TAKER_ROW = {
+    "logged_at": pd.Timestamp("2026-09-23 12:00:00+0000", tz="UTC"), "run_mode": "live",
+    "kalshi_env": "demo", "pred_date": pd.Timestamp("2026-09-23 00:00:00"),
+    "player_name": "James Duckworth", "opponent_name": "Lorenzo Sonego", "tournament": "Chengdu Open",
+    "tournament_level": "D", "is_challenger": False, "event_ticker": "KXATPMATCH-26SEP23DUCSON",
+    "market_ticker": "KXATPMATCH-26SEP23DUCSON-DUC", "model_prob": 0.62, "yes_ask": 0.45, "fee": 0.02,
+    "net_edge": 0.14999999999999997, "kelly": 0.28301886792452824, "bankroll": 1000.0,
+    "stake_target": 50.0, "contracts": 106, "client_order_id": "atpedge-61dc372729af-1790164800",
+    "status": "filled", "skip_reason": None, "order_id": "o1", "fill_count": 106,
+    "avg_fill_price": 0.45, "avg_fee": 0.02, "error": None, "emailed": False,
+}
+_GOLDEN_BANKROLL = {"start": 1000.0, "realized_pnl": 0, "open_cost": 0, "cash": 1000.0,
+                    "bankroll": 1000.0, "as_of": "2026-09-23 12:00:00+00:00",
+                    "kalshi_env": "demo", "mode": "live"}
+
+
+def test_taker_policy_unchanged(monkeypatch, tmp_path):
+    store, fake = _FakeStore({"plays.json": _plays_bytes()}), _fake()
+    assert _main(monkeypatch, tmp_path, store, fake, policy="taker") == 0
+    # Exactly today's single IOC order and nothing else sent to Kalshi.
+    assert fake.placed == [_GOLDEN_TAKER_ORDER]
+    assert [c for c in fake.calls if c[0] in ("create", "cancel")] == [
+        ("create", _GOLDEN_TAKER_ORDER["client_order_id"], _GOLDEN_TAKER_ORDER["ticker"])]
+    log = _read_parquet_file(store, "kalshi_bets.parquet")
+    assert log.to_dict("records") == [_GOLDEN_TAKER_ROW]
+    assert json.loads(store.files["kalshi_bankroll.json"]) == _GOLDEN_BANKROLL
+    # The maker shadow wrote shadow_quote rows only to the quotes file: DUC now
+    # holds the taker's 106 contracts (position cap), so only SON would be quoted.
+    quotes = _read_parquet_file(store, "kalshi_quotes.parquet")
+    assert list(quotes.status) == ["shadow_quote"] and list(quotes["mode"]) == ["shadow"]
+    assert list(quotes.market_ticker) == ["KXATPMATCH-26SEP23DUCSON-SON"]
+    assert "kalshi_maker_fills.parquet" not in store.files
+
+
+def test_taker_policy_maker_shadow_logs_once_per_market_per_utc_day(monkeypatch, tmp_path):
+    store, fake = _FakeStore({"plays.json": _plays_bytes()}), _fake()
+    _main(monkeypatch, tmp_path, store, fake, mode="dry_run")
+    store.puts.clear()
+    _main(monkeypatch, tmp_path, store, fake, mode="dry_run", now=NOW + pd.Timedelta(minutes=15))
+    # Same UTC day, same quotes, same first mids: nothing new for the maker files.
+    assert not {"kalshi_quotes.parquet", "kalshi_maker_state.json"} & {p for p, _ in store.puts}
+    _main(monkeypatch, tmp_path, store, fake, mode="dry_run",
+          now=pd.Timestamp("2026-09-24T00:30:00Z"))  # next UTC day, 5.5h before start
+    quotes = _read_parquet_file(store, "kalshi_quotes.parquet")
+    assert sorted(quotes.market_ticker.str[-3:]) == ["DUC", "DUC", "SON", "SON"]
+    assert set(quotes.status) == {"shadow_quote"}
+    assert sorted(quotes.logged_at.dt.date.astype(str)) == ["2026-09-23"] * 2 + ["2026-09-24"] * 2
+    assert fake.placed == []
+
+
+def test_maker_policy_places_quotes_and_shadows_taker_once_per_event(monkeypatch, tmp_path):
+    store, fake = _FakeStore({"plays.json": _plays_bytes()}), _fake()
+    assert _main(monkeypatch, tmp_path, store, fake, policy="maker") == 0
+    assert _main(monkeypatch, tmp_path, store, fake, policy="maker",
+                 now=NOW + pd.Timedelta(minutes=15)) == 0
+    # No IOC order: every order is a post-only maker bid.
+    assert fake.placed and all(p["time_in_force"] == "good_till_canceled" and p["post_only"] is True
+                               and p["client_order_id"].startswith("atpedge-mk-") for p in fake.placed)
+    assert len(fake.placed) == 4 and len(fake.cancelled) == 2
+    quotes = _read_parquet_file(store, "kalshi_quotes.parquet")
+    assert list(quotes.status) == ["placed"] * 4 and set(quotes["mode"]) == {"live"}
+    # The taker is shadowed: one row per event across both runs. In run 1 the maker's
+    # resting atpedge-mk- bids were already on this event, so the shadow didn't use the guard.
+    log = _read_parquet_file(store, "kalshi_bets.parquet")
+    assert list(log.status) == ["shadow"] and list(log.run_mode) == ["shadow"]
+    assert log.contracts.iloc[0] == 106
+    state = json.loads(store.files["kalshi_maker_state.json"])
+    assert set(state["first_mid"]) == {"KXATPMATCH-26SEP23DUCSON"}
+
+
+def test_maker_policy_fills_recorded_once_and_seen_rebuilt_from_store(monkeypatch, tmp_path):
+    store, fake = _FakeStore({"plays.json": _plays_bytes()}), _fake()
+    _main(monkeypatch, tmp_path, store, fake, policy="maker")
+    duc_order = next(o["order_id"] for o in fake.orders if o["ticker"].endswith("-DUC"))
+    fake.fill_resting(duc_order, 2, ts=NOW + pd.Timedelta(minutes=3))
+    store.fail_paths["kalshi_maker_fills.parquet"] = 1  # the fills push conflicts once
+    assert _main(monkeypatch, tmp_path, store, fake, policy="maker",
+                 now=NOW + pd.Timedelta(minutes=15)) == 0
+    fills = _read_parquet_file(store, "kalshi_maker_fills.parquet")
+    assert len(fills) == 1 and fills["count"].iloc[0] == 2
+    store.puts.clear()
+    (tmp_path / "kalshi_bets.parquet").unlink()  # fresh runner: everything comes from the store
+    assert _main(monkeypatch, tmp_path, store, fake, policy="maker",
+                 now=NOW + pd.Timedelta(minutes=30)) == 0
+    assert "kalshi_maker_fills.parquet" not in [p for p, _ in store.puts]
+    assert len(_read_parquet_file(store, "kalshi_maker_fills.parquet")) == 1
+
+
+@pytest.mark.parametrize("policy", ["taker", "maker"])
+def test_betting_mode_off_does_nothing_under_either_policy(monkeypatch, tmp_path, policy):
+    import kalshi_bot.bettor as bettor_mod
+
+    class NoStore:
+        def __getattr__(self, name):
+            raise AssertionError("BETTING_MODE=off must not touch the state repo")
+
+    def boom():
+        raise AssertionError("BETTING_MODE=off must not construct a Kalshi client")
+
+    monkeypatch.setattr(bettor_mod, "KalshiClient", boom)
+    fake = _fake()
+    assert _main(monkeypatch, tmp_path, NoStore(), None, mode="off", policy=policy) == 0
+    assert fake.calls == []
+
+
+def test_invalid_policy_returns_2_without_client(monkeypatch, tmp_path):
+    import kalshi_bot.bettor as bettor_mod
+
+    def boom():
+        raise AssertionError("an unknown BOT_POLICY must not reach Kalshi")
+
+    monkeypatch.setattr(bettor_mod, "KalshiClient", boom)
+    store = _FakeStore({"plays.json": _plays_bytes()})
+    assert _main(monkeypatch, tmp_path, store, None, policy="both") == 2
+    assert store.puts == []
+
+
+@pytest.mark.parametrize("policy", ["taker", "maker"])
+def test_stdout_is_counts_only(monkeypatch, tmp_path, capsys, policy):
+    store, fake = _FakeStore({"plays.json": _plays_bytes()}), _fake()
+    _main(monkeypatch, tmp_path, store, fake, policy=policy)
+    duc_order = next((o["order_id"] for o in fake.orders if o["ticker"].endswith("-DUC")
+                      and o["status"] == "resting"), None)
+    if duc_order:
+        fake.fill_resting(duc_order, 2, ts=NOW + pd.Timedelta(minutes=3))
+    _main(monkeypatch, tmp_path, store, fake, policy=policy, now=NOW + pd.Timedelta(minutes=15))
+    out = capsys.readouterr().out
+    assert "maker" in out
+    if policy == "maker":
+        assert "placed 2" in out and "fills 1" in out
+    for secret in ("KXATP", "26SEP23", "DUCSON", "-DUC", "-SON", "atpedge", "Duckworth", "Sonego",
+                   "James", "Lorenzo", "Chengdu", "0.44", "0.45", "0.56", "0.57", "1000"):
+        assert secret not in out
+
+
+@pytest.mark.parametrize("path", ["kalshi_quotes.parquet", "kalshi_maker_state.json"])
+def test_maker_state_push_conflict_rereads_remote_and_retries_once(monkeypatch, tmp_path, path):
+    import io
+    store, fake = _FakeStore({"plays.json": _plays_bytes()}), _fake()
+    if path == "kalshi_quotes.parquet":
+        prior = pd.DataFrame([{"logged_at": NOW - pd.Timedelta(days=3), "policy": "maker",
+                               "mode": "live", "market_ticker": "KXATPMATCH-26SEP20AAABBB-AAA",
+                               "status": "placed"}])
+        buf = io.BytesIO()
+        prior.to_parquet(buf, index=False)
+        store.conflict_writes[path] = buf.getvalue()
+    else:
+        store.conflict_writes[path] = b'{"first_mid": {}, "retired": {}}'
+    store.fail_paths[path] = 1
+    assert _main(monkeypatch, tmp_path, store, fake, policy="maker") == 0
+    attempts = [sha for p, sha in store.puts if p == path]
+    assert attempts == [f"sha-{path}"]  # one successful retry, on the re-read sha
+    if path == "kalshi_quotes.parquet":
+        merged = _read_parquet_file(store, path)
+        assert list(merged.status) == ["placed"] * 3  # remote row kept, this run's two re-appended
+        assert merged.market_ticker.iloc[0] == "KXATPMATCH-26SEP20AAABBB-AAA"
+    else:
+        assert set(json.loads(store.files[path])["first_mid"]) == {"KXATPMATCH-26SEP23DUCSON"}
+
+
+def test_maker_error_row_does_not_fail_run(monkeypatch, tmp_path):
+    store = _FakeStore({"plays.json": _plays_bytes()})
+    fake = _fake(reject_crossing={"KXATPMATCH-26SEP23DUCSON-DUC"})
+    assert _main(monkeypatch, tmp_path, store, fake, policy="maker") == 0
+    quotes = _read_parquet_file(store, "kalshi_quotes.parquet")
+    assert sorted(quotes.status) == ["error", "placed"]
+
+
+def test_maker_shadow_exception_fails_run_after_taker_state_pushed(monkeypatch, tmp_path, capsys):
+    class FillsDown(FakeKalshi):
+        def get_fills(self, min_ts=None, ticker=None):
+            raise RuntimeError("KXATPMATCH-26SEP23DUCSON down")
+
+    markets = make_event("KXATPMATCH", "26SEP23", "James Duckworth", "Lorenzo Sonego",
+                         ask1=0.45, ask2=0.57, occurrence="2026-09-24T06:00:00Z")
+    store, fake = _FakeStore({"plays.json": _plays_bytes()}), FillsDown(markets=markets, cash=1000.0)
+    assert _main(monkeypatch, tmp_path, store, fake, policy="taker") == 1
+    assert len(fake.placed) == 1
+    assert list(_read_parquet_file(store, "kalshi_bets.parquet").status) == ["filled"]
+    out = capsys.readouterr().out
+    assert "RuntimeError" in out and "KXATP" not in out
+
+
+def test_dedupe_shadow_quotes_keeps_first_per_market_per_utc_day():
+    from kalshi_bot.bettor import _dedupe_shadow_quotes
+    existing = pd.DataFrame([
+        {"logged_at": pd.Timestamp("2026-09-23T01:00:00Z"), "market_ticker": "M1", "status": "shadow_quote"},
+        {"logged_at": pd.Timestamp("2026-09-23T01:00:00Z"), "market_ticker": "M2", "status": "placed"},
+        {"logged_at": pd.Timestamp("2026-09-22T23:59:00Z"), "market_ticker": "M3", "status": "shadow_quote"},
+    ])
+    t = pd.Timestamp("2026-09-23T23:00:00Z")
+    rows = [{"logged_at": t, "market_ticker": m, "status": s}
+            for m, s in (("M1", "shadow_quote"), ("M2", "shadow_quote"), ("M3", "shadow_quote"),
+                         ("M4", "shadow_quote"), ("M4", "shadow_quote"), ("M1", "cancel_failed"))]
+    kept = _dedupe_shadow_quotes(rows, existing)
+    assert [(r["market_ticker"], r["status"]) for r in kept] == [
+        ("M2", "shadow_quote"), ("M3", "shadow_quote"), ("M4", "shadow_quote"), ("M1", "cancel_failed")]
+    assert _dedupe_shadow_quotes(rows[:1], pd.DataFrame()) == rows[:1]
+
+
+def test_workflow_passes_policy_env():
+    from pathlib import Path
+    wf = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "bot.yml").read_text()
+    assert "BOT_POLICY: ${{ vars.BOT_POLICY || 'taker' }}" in wf
+    assert "MAKER_STOP_HOURS: ${{ vars.MAKER_STOP_HOURS || '4' }}" in wf

@@ -47,6 +47,8 @@ jobs:
         env:
           KALSHI_ENV: ${{ vars.KALSHI_ENV || 'demo' }}
           BETTING_MODE: ${{ github.event.inputs.betting_mode || vars.BETTING_MODE || 'dry_run' }}
+          BOT_POLICY: ${{ vars.BOT_POLICY || 'taker' }}
+          MAKER_STOP_HOURS: ${{ vars.MAKER_STOP_HOURS || '4' }}
           # Secrets, not vars: step env values from vars print in public logs.
           KALSHI_START_BANKROLL: ${{ secrets.KALSHI_START_BANKROLL }}
           STATE_REPO: ${{ secrets.STATE_REPO }}

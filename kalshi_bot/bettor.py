@@ -5,12 +5,17 @@ Plays come from plays.json on the private state branch; the bet log and
 bankroll are written back there. stdout carries counts only (public logs).
 Modes: off (exit), dry_run (price + size + log, send nothing), live (send IOC
 limit orders). Real money only with KALSHI_ENV=prod and BETTING_MODE=live.
+
+BOT_POLICY picks who trades: taker (the IOC bettor above; the maker policy runs
+in shadow, logging the bids it would post) or maker (kalshi_bot.maker posts the
+bids; the taker runs in shadow mode, logging the bets it would place).
 """
 
 from __future__ import annotations
 
 import argparse
 from collections import Counter
+import io
 import json
 import math
 import sys
@@ -20,6 +25,7 @@ import pandas as pd
 
 from kalshi_bot.config import (
     BETTING_MODE,
+    BOT_POLICY,
     BOT_STATE_TOKEN,
     KALSHI_BANKROLL_PATH,
     KALSHI_BETS_PATH,
@@ -36,8 +42,9 @@ from kalshi_bot.config import (
 )
 from kalshi_bot.client import KalshiAPIError, KalshiClient
 from kalshi_bot.bankroll import fetch_bankroll
-from kalshi_bot.bet_log import append_bet_log, load_bet_log, save_bankroll_snapshot
+from kalshi_bot.bet_log import SHADOW_STATUSES, append_bet_log, load_bet_log, save_bankroll_snapshot
 from kalshi_bot.guard import client_order_id, duplicate_reason
+from kalshi_bot.maker import FILL_COLUMNS, QUOTE_COLUMNS, MakerState, run_maker
 from kalshi_bot.matching import find_market, index_open_markets
 from kalshi_bot.state import StateError, StateStore
 from kalshi_bot.sizing import (
@@ -101,9 +108,22 @@ def _base_row(play: Play, mode: str, kalshi_env: str, now: pd.Timestamp) -> dict
     }
 
 
+def _shadow_duplicate(event_ticker: str, log: pd.DataFrame, env: str) -> str | None:
+    """Shadow mode logs each event once. It checks only its own earlier shadow rows,
+    never Kalshi: the maker's atpedge-mk- orders would otherwise hide the event."""
+    if log.empty:
+        return None
+    hit = log[(log["event_ticker"] == event_ticker) & log["status"].isin(SHADOW_STATUSES)]
+    if "kalshi_env" in hit.columns:
+        hit = hit[hit["kalshi_env"] == env]
+    return None if hit.empty else "bet_log"
+
+
 def run(mode, client, start_bankroll, plays, bets_path, bankroll_path, now=None, kalshi_env=KALSHI_ENV):
-    if mode not in ("dry_run", "live"):
-        raise ValueError(f"invalid mode: {mode!r} (must be 'dry_run' or 'live')")
+    """mode: live (send IOC orders), dry_run, or shadow (like dry_run, but logs status
+    "shadow" and dedupes only against earlier shadow rows; used under BOT_POLICY=maker)."""
+    if mode not in ("dry_run", "live", "shadow"):
+        raise ValueError(f"invalid mode: {mode!r} (must be 'dry_run', 'live' or 'shadow')")
 
     now = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
     if now.tzinfo is None:
@@ -170,8 +190,11 @@ def run(mode, client, start_bankroll, plays, bets_path, bankroll_path, now=None,
                 if match.event_ticker in placed_events:
                     rows.append(dict(row, status="skipped", skip_reason="bet_log"))
                     continue
-                reason = duplicate_reason(match.event_ticker, log, client, env=kalshi_env,
-                                          include_dry_run=(mode == "dry_run"))
+                if mode == "shadow":
+                    reason = _shadow_duplicate(match.event_ticker, log, kalshi_env)
+                else:
+                    reason = duplicate_reason(match.event_ticker, log, client, env=kalshi_env,
+                                              include_dry_run=(mode == "dry_run"))
                 if reason:
                     rows.append(dict(row, status="skipped", skip_reason=reason))
                     continue
@@ -188,10 +211,10 @@ def run(mode, client, start_bankroll, plays, bets_path, bankroll_path, now=None,
                 if n < 1:
                     rows.append(dict(row, status="skipped", skip_reason="below_min_stake"))
                     continue
-                if mode == "dry_run":
+                if mode in ("dry_run", "shadow"):
                     remaining -= n * cost
                     placed_events.add(match.event_ticker)
-                    rows.append(dict(row, status="dry_run"))
+                    rows.append(dict(row, status=mode))
                     continue
                 try:
                     resp = client.create_order(match.market_ticker, match.yes_ask, n, row["client_order_id"])
@@ -262,6 +285,127 @@ def _push_bet_log(store, new_rows: pd.DataFrame, sha: str | None) -> None:
     store.put(BETS_FILE, KALSHI_BETS_PATH.read_bytes(), remote_sha, "bot: bet log")
 
 
+# ── Maker policy state (private state repo) ──────────────────────────────────
+
+QUOTES_FILE = "kalshi_quotes.parquet"
+MAKER_FILLS_FILE = "kalshi_maker_fills.parquet"
+MAKER_STATE_FILE = "kalshi_maker_state.json"
+_MAKER_STATUSES = ("placed", "dry_run", "shadow_quote", "error", "cancel_failed")
+_MAKER_HOUSEKEEPING = ("taker_fill", "cancelled", "cancel_errors", "fill_unreadable", "fill_unclassified")
+
+
+def _read_rows(raw: bytes | None, columns: list[str]) -> pd.DataFrame:
+    if not raw:
+        return pd.DataFrame(columns=columns)
+    return pd.read_parquet(io.BytesIO(raw))
+
+
+def _append_rows(raw: bytes | None, rows: list[dict], columns: list[str]) -> bytes:
+    # Rebuilt from records rather than pd.concat: concat warns (FutureWarning) when a
+    # column is all-null on one side, which is routine here (order_id under shadow).
+    records = _read_rows(raw, columns).to_dict("records") + [{c: r.get(c) for c in columns} for r in rows]
+    buf = io.BytesIO()
+    pd.DataFrame.from_records(records, columns=columns).to_parquet(buf, index=False)
+    return buf.getvalue()
+
+
+def _push_appended(store, path: str, raw: bytes | None, sha: str | None, rows: list[dict],
+                   columns: list[str], message: str) -> None:
+    """Append rows to a parquet file in the state repo; on a write conflict, re-read
+    the remote file, re-append and push once more (as _push_bet_log does)."""
+    if not rows:
+        return
+    try:
+        store.put(path, _append_rows(raw, rows, columns), sha, message)
+        return
+    except StateError as e:
+        if e.status_code not in (409, 422):
+            raise
+    raw, sha = store.get(path)
+    store.put(path, _append_rows(raw, rows, columns), sha, message)
+
+
+def _push_replaced(store, path: str, data: bytes, raw: bytes | None, sha: str | None,
+                   message: str) -> None:
+    """Replace a file when its content changed; on a write conflict, re-read the sha
+    and push once more (the bot is the file's only writer, so this run's content wins)."""
+    if data == raw:
+        return
+    try:
+        store.put(path, data, sha, message)
+        return
+    except StateError as e:
+        if e.status_code not in (409, 422):
+            raise
+    _, sha = store.get(path)
+    store.put(path, data, sha, message)
+
+
+def _utc_date(ts):
+    ts = pd.Timestamp(ts)
+    return (ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")).date()
+
+
+def _dedupe_shadow_quotes(rows: list[dict], existing_quotes: pd.DataFrame) -> list[dict]:
+    """Keep a shadow_quote row only if its market has no shadow_quote row on the same
+    UTC date (in the file or earlier in `rows`). Other statuses pass through."""
+    seen = set()
+    if not existing_quotes.empty:
+        prior = existing_quotes[existing_quotes["status"] == "shadow_quote"]
+        seen = {(str(m), _utc_date(t)) for m, t in zip(prior["market_ticker"], prior["logged_at"])
+                if pd.notna(t)}
+    out = []
+    for r in rows:
+        if r.get("status") == "shadow_quote":
+            key = (r["market_ticker"], _utc_date(r["logged_at"]))
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(r)
+    return out
+
+
+def summarize_maker(mode: str, counts: Counter, logged: int) -> str:
+    """Counts only (public logs): `maker (live): placed 6, skipped {too_close_to_start: 4}, fills 1`."""
+    parts = [f"{s} {counts[s]}" for s in _MAKER_STATUSES if counts[s]] or ["quotes 0"]
+    if mode == "shadow":
+        parts[-1] += f" (logged {logged})"
+    skips = {k: v for k, v in counts.items()
+             if v and k not in _MAKER_STATUSES and k not in _MAKER_HOUSEKEEPING and k != "fills"}
+    if skips:
+        ordered = sorted(skips.items(), key=lambda kv: (-kv[1], kv[0]))
+        parts.append("skipped {" + ", ".join(f"{k}: {v}" for k, v in ordered) + "}")
+    parts.append(f"fills {counts['fills']}")
+    parts += [f"{k} {counts[k]}" for k in _MAKER_HOUSEKEEPING if counts[k]]
+    return f"maker ({mode}): " + ", ".join(parts)
+
+
+def _maker_step(mode: str, client, plays: list[Play], store, now: pd.Timestamp,
+                housekeeping: bool) -> None:
+    """One maker run plus its state: quotes and fills appended, MakerState replaced.
+
+    fills_seen is rebuilt from the persisted fills file every run (never stored on its
+    own), so a run that dies after reading fills loses nothing: the next run re-reads them.
+    """
+    quotes_raw, quotes_sha = store.get(QUOTES_FILE)
+    fills_raw, fills_sha = store.get(MAKER_FILLS_FILE)
+    state_raw, state_sha = store.get(MAKER_STATE_FILE)
+    state = MakerState.from_json(state_raw)
+    fills_seen = set(_read_rows(fills_raw, FILL_COLUMNS)["fill_id"].dropna().astype(str))
+    bankroll = fetch_bankroll(client, KALSHI_START_BANKROLL, bet_log=load_bet_log(KALSHI_BETS_PATH),
+                              env=KALSHI_ENV)
+
+    quote_rows, fill_rows, counts = run_maker(mode, client, plays, state, fills_seen, bankroll.bankroll,
+                                              now, KALSHI_ENV, housekeeping)
+    if mode == "shadow":
+        quote_rows = _dedupe_shadow_quotes(quote_rows, _read_rows(quotes_raw, QUOTE_COLUMNS))
+    print(f"  {summarize_maker(mode, counts, len(quote_rows))}")
+
+    _push_appended(store, MAKER_FILLS_FILE, fills_raw, fills_sha, fill_rows, FILL_COLUMNS, "bot: maker fills")
+    _push_appended(store, QUOTES_FILE, quotes_raw, quotes_sha, quote_rows, QUOTE_COLUMNS, "bot: maker quotes")
+    _push_replaced(store, MAKER_STATE_FILE, state.to_json(), state_raw, state_sha, "bot: maker state")
+
+
 def _redacted(e: Exception) -> str:
     status = getattr(e, "status_code", None)
     return type(e).__name__ + (f" (HTTP {status})" if status is not None else "")
@@ -272,10 +416,13 @@ def main(argv: list[str] | None = None, store=None, client=None, now=None) -> in
     parser.add_argument("--mode", choices=["off", "dry_run", "live"], default=BETTING_MODE)
     args = parser.parse_args(argv)
 
-    print(f"Kalshi bettor — mode={args.mode} env={KALSHI_ENV}")
+    print(f"Kalshi bettor — mode={args.mode} env={KALSHI_ENV} policy={BOT_POLICY}")
     if args.mode == "off":
         print("  BETTING_MODE=off; nothing to do")
         return 0
+    if BOT_POLICY not in ("taker", "maker"):
+        print("  ✗ BOT_POLICY must be 'taker' or 'maker'")
+        return 2
     if args.mode == "live" and KALSHI_ENV == "prod" and KALSHI_START_BANKROLL <= 0:
         print("  ✗ KALSHI_START_BANKROLL must be set for live prod betting")
         return 2
@@ -304,9 +451,17 @@ def main(argv: list[str] | None = None, store=None, client=None, now=None) -> in
             KALSHI_BETS_PATH.unlink()
         rows_before = len(load_bet_log(KALSHI_BETS_PATH))
 
-        rows, had_error = run(args.mode, client or KalshiClient(), KALSHI_START_BANKROLL, plays,
+        # The policy in force trades; the other one runs in shadow and only logs.
+        # Housekeeping (record maker fills, cancel leftover maker bids) runs whenever
+        # betting is live, so a maker->taker flip still closes out the last window.
+        client = client or KalshiClient()
+        housekeeping = args.mode == "live"
+        if BOT_POLICY == "maker":
+            _maker_step(args.mode, client, plays, store, now, housekeeping)
+        taker_mode = args.mode if BOT_POLICY == "taker" else "shadow"
+        rows, had_error = run(taker_mode, client, KALSHI_START_BANKROLL, plays,
                               KALSHI_BETS_PATH, KALSHI_BANKROLL_PATH, now=now)
-        print(f"  {summarize(rows)}")
+        print(f"  {'' if BOT_POLICY == 'taker' else 'taker (shadow): '}{summarize(rows)}")
 
         new_rows = load_bet_log(KALSHI_BETS_PATH).iloc[rows_before:]
         if not new_rows.empty:
@@ -314,6 +469,8 @@ def main(argv: list[str] | None = None, store=None, client=None, now=None) -> in
         new_bankroll = KALSHI_BANKROLL_PATH.read_bytes()
         if _bankroll_numbers(new_bankroll) != _bankroll_numbers(bankroll_raw):
             store.put(BANKROLL_FILE, new_bankroll, bankroll_sha, "bot: bankroll")
+        if BOT_POLICY == "taker":
+            _maker_step("shadow", client, plays, store, now, housekeeping)
     except Exception as e:  # public logs: exception type and HTTP status only
         print(f"  ✗ run failed: {_redacted(e)}")
         return 1
