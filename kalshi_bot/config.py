@@ -46,6 +46,19 @@ KALSHI_START_BUFFER_MINUTES = 5  # never bet within this long of scheduled start
 KALSHI_MAX_PRICE_DIVERGENCE = 0.15
 KALSHI_ORDER_PREFIX = "atpedge-"
 
+# ── Maker policy (post short-lived bids at the best bid on both markets) ─────
+BOT_POLICY = os.environ.get("BOT_POLICY", "taker").lower()  # taker | maker
+MAKER_STOP_HOURS = _float_env("MAKER_STOP_HOURS") or 4.0  # stop quoting this long before start
+MAKER_RETIRE_MOVE = 0.10   # retire an event once either side's mid moves this far from its first mid
+MAKER_MAX_SPREAD = 0.10
+MAKER_MIN_BID = 0.05
+MAKER_MAX_ASK = 0.95
+MAKER_ORDER_COUNT = 5
+MAKER_MAX_POSITION = 10
+MAKER_RESTING_BUDGET = 0.40
+MAKER_ORDER_TTL_MIN = 14
+MAKER_ORDER_PREFIX = KALSHI_ORDER_PREFIX + "mk-"
+
 # ── State (a dedicated private repo, via the GitHub contents API) ────────────
 STATE_REPO = os.environ.get("STATE_REPO", "")
 STATE_BRANCH = os.environ.get("STATE_BRANCH", "main")
