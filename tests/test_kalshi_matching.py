@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from kalshi_bot.matching import find_event, find_market, index_open_markets
 from tests.kalshi_fakes import make_event, make_market
@@ -124,3 +125,45 @@ def test_find_event_partial_name_match_is_none():
         "tour": make_event("KXATPMATCH", "26SEP23", "Lorenzo Sonego", "Lorenzo Musetti"),
     })
     assert find_event("Lorenzo Sonego", "James Duckworth", pd.Timestamp("2026-09-23"), index) is None
+
+
+def _parity_cases():
+    sin_dup = [
+        make_market("KXATPMATCH-26SEP23SINSIN", "SIN", "Jannik Sinner", ask=0.45),
+        make_market("KXATPMATCH-26SEP23SINSIN", "SI2", "J. Sinner", ask=0.57),
+    ]
+    one_market = make_event("KXATPMATCH", "26SEP23", "James Duckworth", "Lorenzo Sonego")[:1]
+    partial = make_event("KXATPMATCH", "26SEP23", "Lorenzo Sonego", "Lorenzo Musetti")
+    d = pd.Timestamp("2026-09-23")
+    return [
+        ("in_window_tour", "Lorenzo Sonego", "James Duckworth", d, _index()),
+        ("in_window_challenger", "Keegan Smith", "Martin Damm", d, _index()),
+        ("out_of_window_rematch", "Keegan Smith", "Martin Damm", pd.Timestamp("2026-09-10"), _index()),
+        ("after_window", "Keegan Smith", "Martin Damm", pd.Timestamp("2026-09-30"), _index()),
+        ("partial_name", "Lorenzo Sonego", "James Duckworth", d, index_open_markets({"tour": partial})),
+        ("both_names_one_market", "Jannik Sinner", "Carlos Alcaraz", d, index_open_markets({"tour": sin_dup})),
+        ("single_market_event", "James Duckworth", "Lorenzo Sonego", d, index_open_markets({"tour": one_market})),
+        ("unlisted", "Ann Aa", "Bob Bb", d, _index()),
+        # play lists the opponent's market first in the event: pick must still be the play's player
+        ("opponent_listed_first", "Lorenzo Sonego", "James Duckworth", d, _index()),
+        ("play_player_listed_first", "James Duckworth", "Lorenzo Sonego", d, _index()),
+    ]
+
+
+@pytest.mark.parametrize("case", _parity_cases(), ids=lambda c: c[0])
+def test_find_event_agrees_with_find_market(case):
+    _, player, opponent, date, index = case
+    m = find_market(player, opponent, date, index)
+    ev = find_event(player, opponent, date, index)
+    if m is None:
+        assert ev is None
+        return
+    assert ev is not None
+    pick, other = ev.books
+    assert pick.role == "pick" and other.role == "other"
+    assert pick.market_ticker == m.market_ticker
+    assert other.market_ticker != m.market_ticker
+    assert ev.event_ticker == m.event_ticker
+    assert ev.occurrence_time == m.occurrence_time
+    assert ev.level == m.level
+    assert pick.yes_ask == m.yes_ask and pick.yes_ask_size == m.yes_ask_size
