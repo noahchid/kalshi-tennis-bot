@@ -79,6 +79,14 @@ def _book_extreme(book: Book) -> bool:
     return bid < MAKER_MIN_BID - _EPS or ask > MAKER_MAX_ASK + _EPS
 
 
+def _finite(book: Book) -> bool:
+    return not (math.isnan(book.yes_bid) or math.isnan(book.yes_ask))
+
+
+def _mid(book: Book) -> float:
+    return (book.yes_bid + book.yes_ask) / 2
+
+
 def _wide(book: Book) -> bool:
     return book.yes_ask - book.yes_bid > MAKER_MAX_SPREAD + _EPS
 
@@ -96,10 +104,11 @@ def plan_quotes(
     Event-level reasons (retired, no_start_time, too_close_to_start, retire_move)
     count once per event; market-level reasons (book_extreme, wide_spread,
     position_cap, budget) count once per market. Mutates `state`: records first
-    mids and retires events.
+    mids (only for events that get a quote) and retires events.
     """
     skips: Counter = Counter()
     candidates: list[Quote] = []
+    by_event: dict[str, EventBooks] = {}
     stop = pd.Timedelta(hours=stop_hours)
 
     for ev in events:
@@ -122,19 +131,20 @@ def plan_quotes(
             else:
                 quotable.append(book)
 
+        # Any finite book counts toward the retire rule, even one that is wide or
+        # extreme: after news one side can blow out while the other still looks quotable.
         retire = False
-        for book in quotable:
-            mid = (book.yes_bid + book.yes_ask) / 2
-            first = state.first_mid(ev.event_ticker, book.market_ticker)
-            if first is None:
-                state.set_first_mid(ev.event_ticker, book.market_ticker, mid)
-            elif abs(mid - first) > MAKER_RETIRE_MOVE + _EPS:
-                retire = True
+        for book in ev.books:
+            if _finite(book):
+                first = state.first_mid(ev.event_ticker, book.market_ticker)
+                if first is not None and abs(_mid(book) - first) > MAKER_RETIRE_MOVE + _EPS:
+                    retire = True
         if retire:
             state.retire(ev.event_ticker, now)
             skips["retire_move"] += 1
             continue
 
+        by_event[ev.event_ticker] = ev
         for book in quotable:
             if positions.get(book.market_ticker, 0.0) + MAKER_ORDER_COUNT > MAKER_MAX_POSITION:
                 skips["position_cap"] += 1
@@ -145,7 +155,7 @@ def plan_quotes(
                 role=book.role,
                 price=book.yes_bid,
                 count=MAKER_ORDER_COUNT,
-                mid=(book.yes_bid + book.yes_ask) / 2,
+                mid=_mid(book),
                 yes_bid=book.yes_bid,
                 yes_ask=book.yes_ask,
                 occurrence=ev.occurrence_time,
@@ -162,4 +172,11 @@ def plan_quotes(
             continue
         spent += cost
         quotes.append(q)
+
+    # First mids are fixed the first time an event is actually quoted, for both
+    # sides together; an event that yielded no accepted quote records nothing.
+    for ticker in {q.event_ticker for q in quotes}:
+        for book in by_event[ticker].books:
+            if _finite(book) and state.first_mid(ticker, book.market_ticker) is None:
+                state.set_first_mid(ticker, book.market_ticker, _mid(book))
     return quotes, skips

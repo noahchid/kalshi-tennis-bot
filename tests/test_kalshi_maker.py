@@ -124,14 +124,65 @@ def test_retire_on_other_side_move_too():
     assert not quotes and skips == {"retire_move": 1} and state.is_retired("E1")
 
 
-def test_first_mid_not_overwritten_and_not_set_for_unquotable_book():
+def test_first_mids_recorded_for_both_sides_when_event_quoted_and_not_overwritten():
     state = MakerState()
-    _plan([_ev(pick=(0.04, 0.09))], state=state)
-    assert state.first_mid("E1", "E1-P") is None
+    # pick side is extreme (not quoted) but finite: still recorded alongside the quoted side
+    quotes, _, _ = _plan([_ev(pick=(0.04, 0.09))], state=state)
+    assert [q.market_ticker for q in quotes] == ["E1-O"]
+    assert state.first_mid("E1", "E1-P") == pytest.approx(0.065)
     assert state.first_mid("E1", "E1-O") == pytest.approx(0.52)
-    _plan([_ev(other=(0.51, 0.55))], state=state)
+    _plan([_ev(pick=(0.06, 0.10), other=(0.51, 0.55))], state=state)
+    assert state.first_mid("E1", "E1-P") == pytest.approx(0.065)
     assert state.first_mid("E1", "E1-O") == pytest.approx(0.52)
+
+
+def test_no_first_mids_when_nothing_quoted():
+    state = MakerState()
+    _plan([_ev(pick=(0.04, 0.09), other=(0.90, 0.96))], state=state)  # both extreme
+    assert state.first_mid("E1", "E1-P") is None and state.first_mid("E1", "E1-O") is None
+    _plan([_ev()], positions={"E1-P": 6, "E1-O": 6}, state=state)  # both capped
+    assert state.first_mid("E1", "E1-P") is None and state.first_mid("E1", "E1-O") is None
+
+
+def test_event_fully_dropped_by_budget_records_no_first_mids():
+    state = MakerState()
+    quotes, skips, _ = _plan([_ev("A"), _ev("B")], budget=5.0, state=state)  # A fits, B dropped
+    assert [q.event_ticker for q in quotes] == ["A", "A"] and skips == {"budget": 2}
+    assert state.first_mid("A", "A-P") is not None and state.first_mid("A", "A-O") is not None
+    assert state.first_mid("B", "B-P") is None and state.first_mid("B", "B-O") is None
+
+
+def test_event_with_one_market_dropped_records_both_sides():
+    state = MakerState()
+    _plan([_ev()], positions={"E1-P": 6}, state=state)
     assert state.first_mid("E1", "E1-P") == pytest.approx(0.46)
+    assert state.first_mid("E1", "E1-O") == pytest.approx(0.52)
+
+
+def test_wide_side_with_large_move_retires_event_even_if_other_side_quotable():
+    state = MakerState()
+    _plan([_ev()], state=state)  # first mids 0.46, 0.52
+    blown = _ev(pick=(0.50, 0.68), other=(0.51, 0.55))  # pick wide, mid 0.59 (+0.13); other +0.01
+    quotes, skips, _ = _plan([blown], state=state)
+    assert not quotes and skips["retire_move"] == 1 and state.is_retired("E1")
+    quotes, skips, _ = _plan([_ev()], state=state)
+    assert not quotes and skips == {"retired": 1}
+
+
+def test_wide_side_with_026_move_retires():
+    state = MakerState()
+    _plan([_ev()], state=state)
+    blown = _ev(pick=(0.58, 0.86), other=(0.50, 0.54))  # mid 0.72 vs 0.46 = +0.26
+    quotes, skips, _ = _plan([blown], state=state)
+    assert not quotes and skips["retire_move"] == 1 and state.is_retired("E1")
+
+
+def test_extreme_side_with_large_move_retires():
+    state = MakerState()
+    _plan([_ev()], state=state)
+    blown = _ev(pick=(0.02, 0.06), other=(0.50, 0.54))  # pick mid 0.04 vs 0.46
+    quotes, skips, _ = _plan([blown], state=state)
+    assert not quotes and skips["retire_move"] == 1 and state.is_retired("E1")
 
 
 def test_position_cap_boundary():
