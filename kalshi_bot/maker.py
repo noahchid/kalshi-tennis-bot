@@ -1,4 +1,4 @@
-"""Pure quote planner for the maker policy: decides which bids to post. No I/O."""
+"""Maker policy: a pure quote planner (`plan_quotes`) and its executor (`run_maker`)."""
 
 from __future__ import annotations
 
@@ -9,15 +9,23 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from kalshi_bot.client import KalshiAPIError
 from kalshi_bot.config import (
+    KALSHI_MATCH_SERIES,
     MAKER_MAX_ASK,
     MAKER_MAX_POSITION,
     MAKER_MAX_SPREAD,
     MAKER_MIN_BID,
     MAKER_ORDER_COUNT,
+    MAKER_ORDER_PREFIX,
+    MAKER_ORDER_TTL_MIN,
+    MAKER_RESTING_BUDGET,
     MAKER_RETIRE_MOVE,
+    MAKER_STOP_HOURS,
 )
-from kalshi_bot.matching import Book, EventBooks
+from kalshi_bot.fields import get_position_fp
+from kalshi_bot.guard import client_order_id
+from kalshi_bot.matching import Book, EventBooks, find_event, index_open_markets
 
 _EPS = 1e-9  # float slack so boundary values (spread 0.10, move 0.10) compare as exact
 
@@ -180,3 +188,221 @@ def plan_quotes(
             if _finite(book) and state.first_mid(ticker, book.market_ticker) is None:
                 state.set_first_mid(ticker, book.market_ticker, _mid(book))
     return quotes, skips
+
+
+# ── Executor ─────────────────────────────────────────────────────────────────
+
+QUOTE_COLUMNS = [
+    "logged_at", "policy", "mode", "kalshi_env", "event_ticker", "market_ticker", "role",
+    "yes_bid", "yes_ask", "mid", "occurrence", "price", "count", "status", "error",
+    "order_id", "client_order_id", "expiration_time",
+]
+FILL_COLUMNS = [
+    "fill_id", "fill_ts", "market_ticker", "event_ticker", "order_id", "client_order_id",
+    "price", "count", "fee", "is_taker",
+]
+MAKER_MODES = ("live", "dry_run", "shadow")
+_PLACE_STATUS = {"live": "placed", "dry_run": "dry_run", "shadow": "shadow_quote"}
+
+# Maker orders expire MAKER_ORDER_TTL_MIN after placement, so their fills are at
+# most that old when the next run starts. A week of lookback covers a long bot
+# outage while keeping the fills read (and order lookups for non-maker fills) bounded.
+_FILL_LOOKBACK = pd.Timedelta(days=7)
+
+
+def _first(obj: dict, *keys):
+    for k in keys:
+        v = obj.get(k)
+        if v is not None and v != "":
+            return v
+    return None
+
+
+def _num(v) -> float | None:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fill_ts(fill: dict) -> pd.Timestamp | None:
+    v = _first(fill, "created_time", "ts")
+    if v is None:
+        return None
+    try:
+        if isinstance(v, (int, float)) or str(v).isdigit():
+            return pd.Timestamp(int(v), unit="s", tz="UTC")
+        ts = pd.Timestamp(v)
+        return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_taker(v) -> bool:
+    if isinstance(v, str):
+        return v.strip().lower() == "true"
+    return bool(v)
+
+
+def _event_of(market_ticker: str) -> str:
+    return market_ticker.rsplit("-", 1)[0]
+
+
+def _error_text(e: Exception) -> str:
+    return str(e) if isinstance(e, KalshiAPIError) else repr(e)
+
+
+def _reconcile_fills(client, fills_seen: set[str], now: pd.Timestamp,
+                     counts: Counter) -> list[dict]:
+    """New fills of maker orders, deduped by fill id against (and added to) fills_seen.
+
+    Kalshi's /portfolio/fills field names are unverified; each is read with a
+    fallback: id fill_id|trade_id, time created_time|ts, ticker ticker|market_ticker,
+    price yes_price_dollars|price (dollars), count count_fp|count, fee fee_cost|fees
+    (total dollars for the fill). A fill is a maker fill when its order's
+    client_order_id has MAKER_ORDER_PREFIX: taken from the fill when present,
+    else looked up by order_id among that event's orders.
+    """
+    out: list[dict] = []
+    orders_by_event: dict[str, dict[str, str]] = {}
+    min_ts = int((now - _FILL_LOOKBACK).timestamp())
+    for fill in client.get_fills(min_ts=min_ts):
+        fill_id = _first(fill, "fill_id", "trade_id")
+        market = _first(fill, "ticker", "market_ticker")
+        if fill_id is None or market is None:
+            counts["fill_unreadable"] += 1
+            continue
+        fill_id, market = str(fill_id), str(market)
+        if fill_id in fills_seen:
+            continue
+        event = str(_first(fill, "event_ticker") or _event_of(market))
+        order_id = fill.get("order_id")
+        coid = fill.get("client_order_id")
+        if not coid:
+            if event not in orders_by_event:
+                orders_by_event[event] = {
+                    str(o.get("order_id")): str(o.get("client_order_id") or "")
+                    for o in client.get_orders(event_ticker=event)
+                }
+            coid = orders_by_event[event].get(str(order_id))
+            if coid is None:
+                # Order not found: leave unseen so a later run can classify it.
+                counts["fill_unclassified"] += 1
+                continue
+        fills_seen.add(fill_id)
+        if not str(coid).startswith(MAKER_ORDER_PREFIX):
+            continue
+        taker = _is_taker(fill.get("is_taker"))
+        if taker:
+            counts["taker_fill"] += 1
+        counts["fills"] += 1
+        out.append({
+            "fill_id": fill_id,
+            "fill_ts": _fill_ts(fill),
+            "market_ticker": market,
+            "event_ticker": event,
+            "order_id": order_id,
+            "client_order_id": str(coid),
+            "price": _num(_first(fill, "yes_price_dollars", "price")),
+            "count": _num(_first(fill, "count_fp", "count")),
+            "fee": _num(_first(fill, "fee_cost", "fees")),
+            "is_taker": taker,
+        })
+    return out
+
+
+def _cancel_stale(client, counts: Counter) -> dict[str, str]:
+    """Cancel every resting maker order; returns {market_ticker: error} for failed cancels."""
+    failed: dict[str, str] = {}
+    for o in client.get_orders(status="resting"):
+        if not str(o.get("client_order_id") or "").startswith(MAKER_ORDER_PREFIX):
+            continue
+        try:
+            client.cancel_order(o["order_id"])
+            counts["cancelled"] += 1
+        except Exception as e:  # incl. "already filled / not found": unknown state, hands off
+            counts["cancel_errors"] += 1
+            failed[str(o.get("ticker"))] = _error_text(e)
+    return failed
+
+
+def _positions(client) -> dict[str, float]:
+    """Contracts held per market; an unreadable position fails closed (never quoted)."""
+    out: dict[str, float] = {}
+    for p in client.get_positions():
+        pos = get_position_fp(p)
+        try:
+            out[p["ticker"]] = abs(float(pos))
+        except (TypeError, ValueError):
+            out[p["ticker"]] = math.inf
+    return out
+
+
+def run_maker(mode: str, client, plays, state: MakerState, fills_seen: set[str],
+              bankroll: float, now, kalshi_env: str, housekeeping: bool,
+              ) -> tuple[list[dict], list[dict], Counter]:
+    """One maker run: (quote rows, new fill rows, counts).
+
+    housekeeping=True reconciles maker fills and cancels every resting maker
+    order first, in any mode. Only mode "live" places orders; "dry_run" and
+    "shadow" log the quotes they would post. Prints nothing.
+    """
+    if mode not in MAKER_MODES:
+        raise ValueError(f"invalid maker mode: {mode!r}")
+    if mode == "live" and not housekeeping:
+        raise ValueError("live maker runs must cancel stale orders first (housekeeping=True)")
+    now = pd.Timestamp(now)
+    if now.tzinfo is None:
+        now = now.tz_localize("UTC")
+    counts: Counter = Counter()
+
+    fills: list[dict] = []
+    cancel_failed: dict[str, str] = {}
+    if housekeeping:
+        fills = _reconcile_fills(client, fills_seen, now, counts)
+        cancel_failed = _cancel_stale(client, counts)
+
+    index = index_open_markets({lvl: client.list_markets(series, status="open")
+                                for lvl, series in KALSHI_MATCH_SERIES.items()})
+    events: dict[str, EventBooks] = {}
+    for play in plays:
+        ev = find_event(play.player_name, play.opponent_name, play.pred_date, index)
+        if ev is None:
+            counts["no_event_books"] += 1
+            continue
+        events.setdefault(ev.event_ticker, ev)
+
+    positions = _positions(client)
+    quotes, skips = plan_quotes(list(events.values()), positions, MAKER_RESTING_BUDGET * bankroll,
+                                state, now, MAKER_STOP_HOURS)
+    counts.update(skips)
+
+    attempt = str(int(now.timestamp()))
+    expiration = int(now.timestamp()) + MAKER_ORDER_TTL_MIN * 60
+    rows: list[dict] = []
+    for q in quotes:
+        coid = client_order_id(q.event_ticker, q.market_ticker, attempt, prefix=MAKER_ORDER_PREFIX)
+        row = {
+            "logged_at": now, "policy": "maker", "mode": mode, "kalshi_env": kalshi_env,
+            "event_ticker": q.event_ticker, "market_ticker": q.market_ticker, "role": q.role,
+            "yes_bid": q.yes_bid, "yes_ask": q.yes_ask, "mid": q.mid, "occurrence": q.occurrence,
+            "price": q.price, "count": q.count, "status": None, "error": None,
+            "order_id": None, "client_order_id": coid, "expiration_time": expiration,
+        }
+        if q.market_ticker in cancel_failed:
+            row.update(status="cancel_failed", error=cancel_failed[q.market_ticker])
+        elif mode != "live":
+            row["status"] = _PLACE_STATUS[mode]
+        else:
+            try:
+                resp = client.create_order(
+                    q.market_ticker, q.price, q.count, coid,
+                    time_in_force="good_till_canceled", expiration_time=expiration,
+                    post_only=True, cancel_order_on_pause=True, stp="maker",
+                )
+                row.update(status="placed", order_id=resp.get("order_id"))
+            except Exception as e:  # e.g. post-only cross: log, no retry, keep going
+                row.update(status="error", error=_error_text(e))
+        counts[row["status"]] += 1
+        rows.append(row)
+    return rows, fills, counts

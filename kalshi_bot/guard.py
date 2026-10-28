@@ -15,15 +15,17 @@ from kalshi_bot.bet_log import PLACED_STATUSES
 from kalshi_bot.fields import get_fill_count_fp, get_position_fp
 
 
-def client_order_id(event_ticker: str, market_ticker: str, attempt: str) -> str:
+def client_order_id(event_ticker: str, market_ticker: str, attempt: str,
+                    prefix: str = KALSHI_ORDER_PREFIX) -> str:
     """Bot-prefixed id: a stable per-market hash plus a per-attempt suffix.
 
     Kalshi rejects any reused client_order_id (409 order_already_exists), even
     after an unfilled IOC, so each attempt needs a fresh id. Double-bet
-    protection comes from duplicate_reason, not from id reuse.
+    protection comes from duplicate_reason, not from id reuse. The maker
+    policy passes MAKER_ORDER_PREFIX so its orders are recognisable.
     """
     digest = hashlib.sha1(f"{event_ticker}|{market_ticker}".encode()).hexdigest()[:12]
-    return f"{KALSHI_ORDER_PREFIX}{digest}-{attempt}"
+    return f"{prefix}{digest}-{attempt}"
 
 
 def duplicate_reason(event_ticker: str, bet_log: pd.DataFrame, client, env: str = KALSHI_ENV,
