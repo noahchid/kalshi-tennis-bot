@@ -332,8 +332,8 @@ def _reconcile_fills(client, fills_seen: set[str], now: pd.Timestamp, counts: Co
     else looked up by order_id among that event's orders (read once per event per run).
 
     A maker fill whose price is not strictly inside (0, 1) dollars counts as
-    fill_unreadable and is not stored. A missing is_taker is stored as None
-    (taker_unknown), never as False.
+    fill_unreadable and is stored with price None. A missing is_taker is stored
+    as None (taker_unknown), never as False.
     """
     out: list[dict] = []
     orders_by_event: dict[str, dict[str, str]] = {}
@@ -365,15 +365,15 @@ def _reconcile_fills(client, fills_seen: set[str], now: pd.Timestamp, counts: Co
         fills_seen.add(fill_id)
         if not str(coid).startswith(MAKER_ORDER_PREFIX):
             continue
-        price = _unit_price(_first(fill, "yes_price_dollars", "price"))
-        if price is None:
-            counts["fill_unreadable"] += 1
-            continue
+        # is_taker first: a fill with an unreadable price must still be able to halt.
         taker = _is_taker(fill.get("is_taker"))
         if taker is None:
             counts["taker_unknown"] += 1
         elif taker:
             counts["taker_fill"] += 1
+        price = _unit_price(_first(fill, "yes_price_dollars", "price"))
+        if price is None:  # stored without a price, so the report sees it (unscored)
+            counts["fill_unreadable"] += 1
         counts["fills"] += 1
         out.append({
             "fill_id": fill_id,
@@ -432,10 +432,16 @@ def _cancel_unexpiring(client, rows: list[dict], now: pd.Timestamp, mode: str, k
                        counts: Counter) -> list[dict]:
     """Read back resting maker orders and cancel any without an expiry (an endpoint that
     ignored expiration_time would leave a plain GTC bid). One `error` row ("no_expiry")
-    per such order."""
+    per such order. Never raises: bids were already sent, so this run's rows and state
+    must still be pushed. A failed read-back or cancel counts expiry_check_failed."""
     by_order = {r["order_id"]: r for r in rows if r.get("order_id")}
     out = []
-    for o in client.get_orders(status="resting"):
+    try:
+        resting = client.get_orders(status="resting")
+    except Exception:
+        counts["expiry_check_failed"] += 1
+        return out
+    for o in resting:
         if not _is_maker_order(o) or _has_expiry(o):
             continue
         counts["no_expiry"] += 1
@@ -445,6 +451,7 @@ def _cancel_unexpiring(client, rows: list[dict], now: pd.Timestamp, mode: str, k
             counts["cancelled"] += 1
         except Exception as e:
             counts["cancel_errors"] += 1
+            counts["expiry_check_failed"] += 1
             error = f"no_expiry; cancel failed: {_error_text(e)}"
         base = by_order.get(o.get("order_id"))
         if base is None:

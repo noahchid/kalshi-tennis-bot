@@ -298,7 +298,8 @@ QUOTES_FILE = "kalshi_quotes.parquet"
 MAKER_FILLS_FILE = "kalshi_maker_fills.parquet"
 MAKER_STATE_FILE = "kalshi_maker_state.json"
 _MAKER_STATUSES = ("placed", "dry_run", "shadow_quote", "error", "cancel_failed")
-_MAKER_HOUSEKEEPING = ("halted", "taker_fill", "taker_unknown", "no_expiry", "cancelled", "cancel_errors",
+_MAKER_HOUSEKEEPING = ("halted", "taker_fill", "taker_unknown", "no_expiry", "expiry_check_failed",
+                       "cancelled", "cancel_errors",
                        "fill_unreadable", "fill_unclassified")
 
 
@@ -455,6 +456,13 @@ def _maker_step(mode: str, client, plays: list[Play], store, now: pd.Timestamp,
             errors.append(e)
     if errors:
         raise errors[0]
+    if counts["expiry_check_failed"]:  # a bid may rest without an expiry: fail the run (red)
+        raise MakerExpiryCheckFailed("expiry read-back or cancel failed")
+
+
+class MakerExpiryCheckFailed(RuntimeError):
+    """The post-placement expiry read-back (or a cancel it needed) failed; raised only
+    after this run's maker state was pushed."""
 
 
 def _maker_cancel_only(client) -> None:

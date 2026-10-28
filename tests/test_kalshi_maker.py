@@ -589,11 +589,59 @@ def test_missing_is_taker_is_stored_as_unknown_and_does_not_halt():
 
 
 @pytest.mark.parametrize("price", ["45", "0", "1.00", "-0.2", "nan", None])
-def test_fill_price_outside_unit_interval_is_unreadable(price):
+def test_fill_price_outside_unit_interval_is_stored_without_price(price):
     fake = _mfake()
     fake.fills.append(_maker_fill("f1", client_order_id="atpedge-mk-zzz-1", yes_price_dollars=price))
     _, fills, counts = _mrun(fake, mode="dry_run")
-    assert fills == [] and counts["fill_unreadable"] == 1 and counts["fills"] == 0
+    assert [f["fill_id"] for f in fills] == ["f1"] and fills[0]["price"] is None
+    assert counts["fill_unreadable"] == 1 and counts["fills"] == 1
+
+
+def test_taker_fill_with_unreadable_price_still_halts():
+    fake = _mfake()
+    fake.fills.append(_maker_fill("f1", client_order_id="atpedge-mk-zzz-1", yes_price_dollars="45",
+                                  is_taker=True))
+    state = MakerState()
+    quotes, fills, counts = _mrun(fake, state=state)
+    assert state.halted and counts["taker_fill"] == 1 and counts["fill_unreadable"] == 1
+    assert len(fills) == 1 and fills[0]["price"] is None and fills[0]["is_taker"] is True
+    assert quotes == [] and not _creates(fake)
+
+
+class _ReadbackDown(FakeKalshi):
+    """The resting-orders read after placing (the second one this run) fails."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.resting_reads = 0
+
+    def get_orders(self, event_ticker=None, status=None):
+        if status == "resting":
+            self.resting_reads += 1
+            if self.resting_reads == 2:
+                from kalshi_bot.client import KalshiAPIError
+                raise KalshiAPIError(429, '{"error":"rate limited KXATPMATCH-26OCT29DUCSON"}')
+        return super().get_orders(event_ticker=event_ticker, status=status)
+
+
+def test_expiry_readback_failure_keeps_rows_and_state_and_is_counted():
+    markets = make_event("KXATPMATCH", "26OCT29", "James Duckworth", "Lorenzo Sonego",
+                         ask1=0.45, ask2=0.57, occurrence="2026-10-29T18:00:00Z")
+    fake = _ReadbackDown(markets=markets, cash=1000.0)
+    state = MakerState()
+    quotes, _, counts = _mrun(fake, state=state)
+    assert [r["status"] for r in quotes] == ["placed", "placed"]
+    assert counts["expiry_check_failed"] == 1 and counts["placed"] == 2
+    assert state.first_mid(EV, DUC) == pytest.approx(0.445)
+
+
+def test_failed_cancel_of_unexpiring_order_counts_expiry_check_failed():
+    fake = _mfake()
+    fake.honor_expiry = False
+    fake.fail_cancel = {"o1"}
+    quotes, _, counts = _mrun(fake)
+    assert counts["no_expiry"] == 2 and counts["expiry_check_failed"] == 1
+    assert any(r["error"].startswith("no_expiry; cancel failed") for r in quotes if r["status"] == "error")
 
 
 # I3: a confirmed taker fill halts the maker (persisted) until the flag is removed by hand

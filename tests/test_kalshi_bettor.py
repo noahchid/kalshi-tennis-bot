@@ -950,3 +950,22 @@ def test_dry_run_with_stale_plays_cancels_nothing(monkeypatch, tmp_path):
     fake = _resting_fake()
     assert _main(monkeypatch, tmp_path, store, fake, mode="dry_run") == 0
     assert fake.cancelled == []
+
+
+# re-review: a failed expiry read-back after bids were sent still pushes the run's state, then exits 1
+def test_expiry_readback_failure_still_pushes_quotes_and_state_and_exits_1(monkeypatch, tmp_path, capsys):
+    from tests.test_kalshi_maker import _ReadbackDown
+    _env(monkeypatch, "demo")
+    markets = make_event("KXATPMATCH", "26SEP23", "James Duckworth", "Lorenzo Sonego",
+                         ask1=0.45, ask2=0.57, occurrence="2026-09-24T06:00:00Z")
+    store = _FakeStore({"plays.json": _plays_bytes()})
+    fake = _ReadbackDown(markets=markets, cash=1000.0)
+    assert _main(monkeypatch, tmp_path, store, fake, policy="maker") == 1
+    assert len(fake.placed) == 2
+    assert list(_read_parquet_file(store, "kalshi_quotes.parquet").status) == ["placed", "placed"]
+    assert set(json.loads(store.files["kalshi_maker_state.json"])["demo"]["first_mid"]) == {
+        "KXATPMATCH-26SEP23DUCSON"}
+    out = capsys.readouterr().out
+    assert "expiry_check_failed 1" in out
+    for secret in ("KXATP", "26SEP23", "DUCSON", "atpedge", "Duckworth", "rate limited", "0.44", "0.56"):
+        assert secret not in out
