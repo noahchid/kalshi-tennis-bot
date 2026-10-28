@@ -121,3 +121,85 @@ def test_balance_scoped_to_exchange_index(key_path):
     c = KalshiClient("kid", str(path), base_url="https://x.test", session=s)
     assert c.get_balance(exchange_index=3) == 50.0
     assert s.calls[0]["params"] == {"exchange_index": 3}
+
+
+def test_create_order_default_body_unchanged(key_path):
+    path, _ = key_path
+    s = _Session([_Resp({"order": {"order_id": "o1"}})])
+    c = KalshiClient("kid", str(path), base_url="https://x.test", session=s)
+    c.create_order("KX-T-SMI", 0.47, 3, "atpedge-abc")
+    assert s.calls[0]["json"] == {
+        "ticker": "KX-T-SMI",
+        "side": "bid",
+        "count": "3.00",
+        "price": "0.47",
+        "time_in_force": "immediate_or_cancel",
+        "self_trade_prevention_type": "taker_at_cross",
+        "client_order_id": "atpedge-abc",
+    }
+
+
+def test_create_order_maker_body(key_path):
+    path, _ = key_path
+    s = _Session([_Resp({"order": {"order_id": "o2"}})])
+    c = KalshiClient("kid", str(path), base_url="https://x.test", session=s)
+    out = c.create_order(
+        "KX-T-SMI",
+        0.42,
+        5,
+        "atpedge-mk-abc",
+        time_in_force="good_till_canceled",
+        expiration_time=1793000000,
+        post_only=True,
+        cancel_order_on_pause=True,
+        stp="maker",
+    )
+    assert out["order_id"] == "o2"
+    call = s.calls[0]
+    assert call["method"] == "POST"
+    assert call["url"] == "https://x.test/trade-api/v2/portfolio/events/orders"
+    assert call["json"] == {
+        "ticker": "KX-T-SMI",
+        "side": "bid",
+        "count": "5.00",
+        "price": "0.42",
+        "time_in_force": "good_till_canceled",
+        "self_trade_prevention_type": "maker",
+        "client_order_id": "atpedge-mk-abc",
+        "expiration_time": 1793000000,
+        "post_only": True,
+        "cancel_order_on_pause": True,
+    }
+
+
+def test_cancel_order_path(key_path):
+    path, _ = key_path
+    s = _Session([_Resp({"order": {"order_id": "o9", "status": "canceled"}})])
+    c = KalshiClient("kid", str(path), base_url="https://x.test", session=s)
+    out = c.cancel_order("o9")
+    call = s.calls[0]
+    assert call["method"] == "DELETE"
+    assert call["url"] == "https://x.test/trade-api/v2/portfolio/orders/o9"
+    assert call["json"] is None
+    assert out["order_id"] == "o9"
+    assert call["headers"]["KALSHI-ACCESS-KEY"] == "kid"
+
+
+def test_get_fills_paginates(key_path):
+    path, _ = key_path
+    s = _Session([
+        _Resp({"fills": [{"fill_id": "f1"}], "cursor": "c1"}),
+        _Resp({"fills": [{"fill_id": "f2"}], "cursor": ""}),
+    ])
+    c = KalshiClient("kid", str(path), base_url="https://x.test", session=s)
+    out = c.get_fills(min_ts=100, ticker="KX-T-SMI")
+    assert [f["fill_id"] for f in out] == ["f1", "f2"]
+    assert s.calls[0]["method"] == "GET"
+    assert s.calls[0]["url"] == "https://x.test/trade-api/v2/portfolio/fills"
+    assert s.calls[0]["params"]["min_ts"] == 100
+    assert s.calls[0]["params"]["ticker"] == "KX-T-SMI"
+    assert s.calls[1]["params"]["cursor"] == "c1"
+    s2 = _Session([_Resp({"fills": []})])
+    c2 = KalshiClient("kid", str(path), base_url="https://x.test", session=s2)
+    assert c2.get_fills() == []
+    assert "min_ts" not in s2.calls[0]["params"] and "ticker" not in s2.calls[0]["params"]

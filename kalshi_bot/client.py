@@ -154,17 +154,45 @@ class KalshiClient:
     def get_settlements(self, min_ts: int | None = None) -> list[dict]:
         return self._paginate("/portfolio/settlements", "settlements", {"min_ts": min_ts})
 
-    def create_order(self, ticker: str, price: float, count: int, client_order_id: str) -> dict:
+    def get_fills(self, min_ts: int | None = None, ticker: str | None = None) -> list[dict]:
+        return self._paginate("/portfolio/fills", "fills", {"min_ts": min_ts, "ticker": ticker})
+
+    def create_order(
+        self,
+        ticker: str,
+        price: float,
+        count: int,
+        client_order_id: str,
+        *,
+        time_in_force: str = "immediate_or_cancel",
+        expiration_time: int | None = None,
+        post_only: bool | None = None,
+        cancel_order_on_pause: bool | None = None,
+        stp: str = "taker_at_cross",
+    ) -> dict:
         body = {
             "ticker": ticker,
             "side": "bid",
             "count": f"{int(count):.2f}",
             "price": f"{price:.2f}",
-            "time_in_force": "immediate_or_cancel",
-            "self_trade_prevention_type": "taker_at_cross",
+            "time_in_force": time_in_force,
+            "self_trade_prevention_type": stp,
             "client_order_id": client_order_id,
         }
+        # Optional maker fields are added only when set, so a plain taker call
+        # sends the same body as before.
+        if expiration_time is not None:
+            body["expiration_time"] = int(expiration_time)
+        if post_only is not None:
+            body["post_only"] = post_only
+        if cancel_order_on_pause is not None:
+            body["cancel_order_on_pause"] = cancel_order_on_pause
         data = self.request("POST", "/portfolio/events/orders", json_body=body)
+        return data.get("order", data)
+
+    def cancel_order(self, order_id: str) -> dict:
+        # Path is unverified until the demo probe (Task 7).
+        data = self.request("DELETE", f"/portfolio/orders/{order_id}")
         return data.get("order", data)
 
 
