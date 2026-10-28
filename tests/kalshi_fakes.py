@@ -4,7 +4,9 @@ from __future__ import annotations
 
 
 def make_market(event_ticker, code, name, ask=0.50, ask_size=1000.0, result="",
-                occurrence="2030-01-01T00:00:00Z", rules=""):
+                occurrence="2030-01-01T00:00:00Z", rules="", bid=None, bid_size=1000.0):
+    if bid is None:
+        bid = ask - 0.01
     return {
         "event_ticker": event_ticker,
         "ticker": f"{event_ticker}-{code}",
@@ -12,6 +14,8 @@ def make_market(event_ticker, code, name, ask=0.50, ask_size=1000.0, result="",
         "title": f"{name} wins",
         "yes_ask_dollars": f"{ask:.4f}",
         "yes_ask_size_fp": f"{ask_size:.2f}",
+        "yes_bid_dollars": f"{bid:.4f}",
+        "yes_bid_size_fp": f"{bid_size:.2f}",
         "status": "active" if not result else "finalized",
         "result": result,
         "occurrence_datetime": occurrence,
@@ -21,7 +25,7 @@ def make_market(event_ticker, code, name, ask=0.50, ask_size=1000.0, result="",
 
 
 def make_event(series, date_code, p1, p2, ask1=0.50, ask2=0.52, result_winner=None,
-               walkover=False, occurrence="2030-01-01T00:00:00Z", rules=""):
+               walkover=False, occurrence="2030-01-01T00:00:00Z", rules="", bid1=None, bid2=None):
     """Two markets for one match. date_code like '26SEP23'."""
     c1, c2 = p1.split()[-1][:3].upper(), p2.split()[-1][:3].upper()
     ev = f"{series}-{date_code}{c1}{c2}"
@@ -33,8 +37,8 @@ def make_event(series, date_code, p1, p2, ask1=0.50, ask2=0.52, result_winner=No
         r1 = "yes" if result_winner == p1 else "no"
         r2 = "yes" if result_winner == p2 else "no"
     return [
-        make_market(ev, c1, p1, ask1, result=r1, occurrence=occurrence, rules=rules),
-        make_market(ev, c2, p2, ask2, result=r2, occurrence=occurrence, rules=rules),
+        make_market(ev, c1, p1, ask1, result=r1, occurrence=occurrence, rules=rules, bid=bid1),
+        make_market(ev, c2, p2, ask2, result=r2, occurrence=occurrence, rules=rules, bid=bid2),
     ]
 
 
