@@ -136,6 +136,16 @@ def run_probe(client, env: str = KALSHI_ENV, sleep=time.sleep) -> dict:
     coid = f"{MAKER_ORDER_PREFIX}probe-rest-{stamp}"
     report["rest_order"] = _post_only(client, ticker, REST_PRICE, coid, LONG_TTL_S)
     checks["rest_order_accepted"] = report["rest_order"]["ok"]
+    if not report["rest_order"]["ok"]:
+        err = str(report["rest_order"].get("error") or "")
+        if "not_currently_allowed" in err:  # Kalshi geo-blocks some runner IPs: retry on another runner
+            report["geo_blocked"] = True
+            report["all_passed"] = False
+            return report
+        # a non-geo rejection: find which order-body field causes it, on this market
+        report["variants"] = {name: _variant(client, ticker, f"{MAKER_ORDER_PREFIX}var-{name}-{stamp}", v)
+                              for name, v in VARIANTS.items()}
+        _cancel_stale(client, Counter())
     rest = _resting(client, coid)
     report["resting_order_fields"] = sorted(rest[0]) if rest else []
     report["resting_order"] = rest[0] if rest else None
@@ -210,6 +220,8 @@ def main() -> int:
         print(f"✗ {e}")
         return 2
     print(json.dumps(report, indent=2, default=str))
+    if report.get("geo_blocked"):
+        return 3
     return 0 if report.get("all_passed") else 1
 
 
