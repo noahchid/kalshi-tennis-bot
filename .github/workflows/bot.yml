@@ -66,7 +66,10 @@ jobs:
         env:
           KALSHI_ENV: ${{ github.event.inputs.kalshi_env || vars.KALSHI_ENV || 'demo' }}
           BETTING_MODE: ${{ github.event.inputs.betting_mode || vars.BETTING_MODE || 'dry_run' }}
-          BOT_POLICY: ${{ github.event.inputs.bot_policy || vars.BOT_POLICY || 'taker' }}
+          # blank = follow the scheduled switch in kalshi_bot/config.py (taker until
+          # MAKER_SWITCH_AT, maker after); a set BOT_POLICY variable always wins
+          BOT_POLICY: ${{ github.event.inputs.bot_policy || vars.BOT_POLICY }}
+          MAKER_SWITCH_AT: ${{ vars.MAKER_SWITCH_AT }}
           MAKER_STOP_HOURS: ${{ vars.MAKER_STOP_HOURS || '4' }}
           # Secrets, not vars: step env values from vars print in public logs.
           KALSHI_START_BANKROLL: ${{ secrets.KALSHI_START_BANKROLL }}

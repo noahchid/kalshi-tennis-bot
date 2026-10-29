@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ── Kalshi API ───────────────────────────────────────────────────────────────
@@ -47,7 +48,29 @@ KALSHI_MAX_PRICE_DIVERGENCE = 0.15
 KALSHI_ORDER_PREFIX = "atpedge-"
 
 # ── Maker policy (post short-lived bids at the best bid on both markets) ─────
-BOT_POLICY = os.environ.get("BOT_POLICY", "taker").lower()  # taker | maker
+# Scheduled switch to the maker policy (Noah, 2026-10-29: record-only until then).
+# An explicit BOT_POLICY (repo variable or manual input) always wins; when it is
+# blank the bot is taker before MAKER_SWITCH_AT and maker from then on. An
+# unreadable MAKER_SWITCH_AT (e.g. "never") keeps the taker.
+DEFAULT_MAKER_SWITCH_AT = "2026-11-02T14:00:00Z"
+
+
+def resolve_policy(explicit: str, switch_at: str, now: datetime) -> str:
+    explicit = (explicit or "").strip().lower()
+    if explicit:
+        return explicit
+    try:
+        at = datetime.fromisoformat(str(switch_at).strip().replace("Z", "+00:00"))
+    except ValueError:
+        return "taker"
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return "maker" if now >= at else "taker"
+
+
+MAKER_SWITCH_AT = os.environ.get("MAKER_SWITCH_AT", "") or DEFAULT_MAKER_SWITCH_AT
+BOT_POLICY = resolve_policy(os.environ.get("BOT_POLICY", ""), MAKER_SWITCH_AT,
+                            datetime.now(timezone.utc))  # taker | maker
 MAKER_STOP_HOURS = _float_env("MAKER_STOP_HOURS") or 4.0  # stop quoting this long before start
 MAKER_RETIRE_MOVE = 0.10   # retire an event once either side's mid moves this far from its first mid
 MAKER_MAX_SPREAD = 0.10

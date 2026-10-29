@@ -731,7 +731,9 @@ def test_dedupe_shadow_quotes_keeps_first_per_market_per_utc_day():
 def test_workflow_passes_policy_env():
     from pathlib import Path
     wf = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "bot.yml").read_text()
-    assert "BOT_POLICY: ${{ github.event.inputs.bot_policy || vars.BOT_POLICY || 'taker' }}" in wf
+    # blank BOT_POLICY = follow the scheduled switch (config.resolve_policy); a set one always wins
+    assert "BOT_POLICY: ${{ github.event.inputs.bot_policy || vars.BOT_POLICY }}" in wf
+    assert "MAKER_SWITCH_AT: ${{ vars.MAKER_SWITCH_AT }}" in wf
     assert "KALSHI_ENV: ${{ github.event.inputs.kalshi_env || vars.KALSHI_ENV || 'demo' }}" in wf
     assert "MAKER_STOP_HOURS: ${{ vars.MAKER_STOP_HOURS || '4' }}" in wf
     assert """KALSHI_ENV="$(printf '%s' "$KALSHI_ENV" | tr '[:upper:]' '[:lower:]')\"""" in wf
