@@ -199,17 +199,28 @@ def test_create_order_maker_body(key_path):
     }
 
 
-def test_cancel_order_path(key_path):
+def test_cancel_order_uses_v2_path_with_market_routing(key_path):
+    # Demo probe: DELETE /portfolio/orders/{id} answers 410 deprecated_v1_order_endpoint.
+    # V2 cancel is DELETE /portfolio/events/orders/{id}; market_ticker auto-routes the shard.
     path, _ = key_path
-    s = _Session([_Resp({"order": {"order_id": "o9", "status": "canceled"}})])
+    s = _Session([_Resp({"order_id": "o9", "client_order_id": "c9", "reduced_by": "5.00"})])
     c = KalshiClient("kid", str(path), base_url="https://x.test", session=s)
-    out = c.cancel_order("o9")
+    out = c.cancel_order("o9", "KXATPMATCH-26OCT29AAABBB-AAA")
     call = s.calls[0]
     assert call["method"] == "DELETE"
-    assert call["url"] == "https://x.test/trade-api/v2/portfolio/orders/o9"
+    assert call["url"] == "https://x.test/trade-api/v2/portfolio/events/orders/o9"
+    assert call["params"] == {"market_ticker": "KXATPMATCH-26OCT29AAABBB-AAA"}
     assert call["json"] is None
-    assert out["order_id"] == "o9"
+    assert out["order_id"] == "o9" and out["reduced_by"] == "5.00"
     assert call["headers"]["KALSHI-ACCESS-KEY"] == "kid"
+
+
+def test_get_order_by_id(key_path):
+    path, _ = key_path
+    s = _Session([_Resp({"order": {"order_id": "o9", "status": "resting"}})])
+    c = KalshiClient("kid", str(path), base_url="https://x.test", session=s)
+    assert c.get_order("o9")["status"] == "resting"
+    assert s.calls[0]["url"] == "https://x.test/trade-api/v2/portfolio/orders/o9"
 
 
 def test_get_fills_paginates(key_path):

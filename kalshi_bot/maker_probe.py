@@ -70,6 +70,29 @@ def _resting(client, coid: str) -> list[dict]:
     return [o for o in client.get_orders(status="resting") if o.get("client_order_id") == coid]
 
 
+def _resting_polled(client, coid: str, sleep, tries: int = 5) -> list[dict]:
+    """The resting listing can lag a fresh order by a few seconds."""
+    for i in range(tries):
+        found = _resting(client, coid)
+        if found:
+            return found
+        if i < tries - 1:
+            sleep(2)
+    return []
+
+
+def _order_view(client, resp: dict | None) -> dict | None:
+    oid = (resp or {}).get("order_id")
+    if not oid:
+        return None
+    try:
+        o = client.get_order(oid)
+    except KalshiAPIError as e:
+        return {"error": e.body, "status_code": e.status_code}
+    return {k: o.get(k) for k in ("status", "expiration_time", "cancel_order_on_pause", "remaining_count_fp",
+                                  "fill_count_fp", "last_update_time", "time_in_force", "ticker")}
+
+
 VARIANTS = {  # which order-body field makes a resting order acceptable on this exchange?
     "bot_body": dict(time_in_force="good_till_canceled", ttl=True, post_only=True, cancel_order_on_pause=True, stp="maker"),
     "no_cancel_on_pause": dict(time_in_force="good_till_canceled", ttl=True, post_only=True, cancel_order_on_pause=None, stp="maker"),
@@ -146,7 +169,8 @@ def run_probe(client, env: str = KALSHI_ENV, sleep=time.sleep) -> dict:
         report["variants"] = {name: _variant(client, ticker, f"{MAKER_ORDER_PREFIX}var-{name}-{stamp}", v)
                               for name, v in VARIANTS.items()}
         _cancel_stale(client, Counter())
-    rest = _resting(client, coid)
+    rest = _resting_polled(client, coid, sleep)
+    report["rest_order_view"] = _order_view(client, report["rest_order"].get("response"))
     report["resting_order_fields"] = sorted(rest[0]) if rest else []
     report["resting_order"] = rest[0] if rest else None
     checks["rest_order_listed_as_resting"] = len(rest) == 1
@@ -173,11 +197,13 @@ def run_probe(client, env: str = KALSHI_ENV, sleep=time.sleep) -> dict:
     # 5. exchange-side expiry
     short = f"{MAKER_ORDER_PREFIX}probe-ttl-{stamp}"
     report["short_ttl_order"] = _post_only(client, ticker, REST_PRICE, short, SHORT_TTL_S)
-    listed_before = len(_resting(client, short))
+    listed_before = len(_resting_polled(client, short, sleep))
     sleep(SHORT_TTL_S + 30)
     listed_after = len(_resting(client, short))
     report["short_ttl_listed_before_after"] = [listed_before, listed_after]
-    checks["expiry_honoured"] = listed_before == 1 and listed_after == 0
+    report["short_ttl_view_after"] = _order_view(client, report["short_ttl_order"].get("response"))
+    status_after = (report["short_ttl_view_after"] or {}).get("status")
+    checks["expiry_honoured"] = listed_before == 1 and listed_after == 0 and status_after not in (None, "resting")
     _cancel_stale(client, Counter())
 
     # 6. a real fill, read back by the bot's parser

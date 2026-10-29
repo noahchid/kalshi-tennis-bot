@@ -206,9 +206,16 @@ class KalshiClient:
         data = self.request("POST", "/portfolio/events/orders", json_body=body)
         return data.get("order", data)
 
-    def cancel_order(self, order_id: str) -> dict:
-        # Path is unverified until the demo probe (Task 7).
-        data = self.request("DELETE", f"/portfolio/orders/{order_id}")
+    def cancel_order(self, order_id: str, market_ticker: str) -> dict:
+        # V2 cancel (the V1 DELETE /portfolio/orders/{id} answers 410 on demo).
+        # market_ticker auto-routes to the order's exchange shard. Returns
+        # {order_id, client_order_id, reduced_by}.
+        data = self.request("DELETE", f"/portfolio/events/orders/{order_id}",
+                            params={"market_ticker": market_ticker})
+        return data.get("order", data)
+
+    def get_order(self, order_id: str) -> dict:
+        data = self.request("GET", f"/portfolio/orders/{order_id}")
         return data.get("order", data)
 
 

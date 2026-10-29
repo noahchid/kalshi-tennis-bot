@@ -157,15 +157,23 @@ class FakeKalshi:
                 "average_fill_price": f"{price:.4f}" if filled else None,
                 "average_fee_paid": "0.0200" if filled else None}
 
-    def cancel_order(self, order_id):
+    def cancel_order(self, order_id, market_ticker):
         from kalshi_bot.client import KalshiAPIError
         self.calls.append(("cancel", order_id))
         if order_id in self.fail_cancel:
             raise KalshiAPIError(404, '{"error":{"code":"not_found"}}')
         for o in self.orders:
-            if o.get("order_id") == order_id and o["status"] == "resting":
+            # V2 cancel routes by market_ticker: a wrong/missing ticker cannot find the order
+            if o.get("order_id") == order_id and o["status"] == "resting" and o.get("ticker") == market_ticker:
                 o["status"] = "canceled"
                 self.cancelled.append(order_id)
+                return dict(o)
+        raise KalshiAPIError(404, '{"error":{"code":"not_found"}}')
+
+    def get_order(self, order_id):
+        from kalshi_bot.client import KalshiAPIError
+        for o in self.orders:
+            if o.get("order_id") == order_id:
                 return dict(o)
         raise KalshiAPIError(404, '{"error":{"code":"not_found"}}')
 

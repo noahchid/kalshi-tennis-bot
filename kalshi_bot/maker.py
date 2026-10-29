@@ -408,7 +408,7 @@ def _cancel_stale(client, counts: Counter) -> dict[str, str]:
         if not _is_maker_order(o):
             continue
         try:
-            client.cancel_order(o["order_id"])
+            client.cancel_order(o["order_id"], o.get("ticker"))
             counts["cancelled"] += 1
         except Exception as e:  # incl. "already filled / not found": unknown state, hands off
             counts["cancel_errors"] += 1
@@ -447,7 +447,7 @@ def _cancel_unexpiring(client, rows: list[dict], now: pd.Timestamp, mode: str, k
         counts["no_expiry"] += 1
         error = "no_expiry"
         try:
-            client.cancel_order(o["order_id"])
+            client.cancel_order(o["order_id"], o.get("ticker"))
             counts["cancelled"] += 1
         except Exception as e:
             counts["cancel_errors"] += 1
