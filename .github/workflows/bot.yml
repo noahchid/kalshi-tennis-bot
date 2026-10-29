@@ -105,6 +105,7 @@ jobs:
         if: github.event.inputs.kalshi_maker_probe == 'true'
         env:
           KALSHI_ENV: demo
+          PROBE_ARGS: ${{ github.event.inputs.maker_probe_args }}
           DEMO_KEY_ID: ${{ secrets.KALSHI_DEMO_KEY_ID }}
           DEMO_PEM: ${{ secrets.KALSHI_DEMO_PRIVATE_KEY }}
         run: |
@@ -113,4 +114,4 @@ jobs:
           trap 'rm -f "$RUNNER_TEMP/kalshi.pem"' EXIT
           printf '%s\n' "$DEMO_PEM" > "$RUNNER_TEMP/kalshi.pem"
           export KALSHI_API_KEY_ID="$DEMO_KEY_ID" KALSHI_PRIVATE_KEY_PATH="$RUNNER_TEMP/kalshi.pem"
-          python3 -m kalshi_bot.maker_probe ${{ github.event.inputs.maker_probe_args }}
+          if [ "$PROBE_ARGS" = "--variants" ]; then python3 -m kalshi_bot.maker_probe --variants; else python3 -m kalshi_bot.maker_probe; fi
