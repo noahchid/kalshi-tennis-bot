@@ -70,6 +70,54 @@ def _resting(client, coid: str) -> list[dict]:
     return [o for o in client.get_orders(status="resting") if o.get("client_order_id") == coid]
 
 
+VARIANTS = {  # which order-body field makes a resting order acceptable on this exchange?
+    "bot_body": dict(time_in_force="good_till_canceled", ttl=True, post_only=True, cancel_order_on_pause=True, stp="maker"),
+    "no_cancel_on_pause": dict(time_in_force="good_till_canceled", ttl=True, post_only=True, cancel_order_on_pause=None, stp="maker"),
+    "no_post_only": dict(time_in_force="good_till_canceled", ttl=True, post_only=None, cancel_order_on_pause=True, stp="maker"),
+    "no_expiry": dict(time_in_force="good_till_canceled", ttl=False, post_only=True, cancel_order_on_pause=True, stp="maker"),
+    "stp_taker_at_cross": dict(time_in_force="good_till_canceled", ttl=True, post_only=True, cancel_order_on_pause=True, stp="taker_at_cross"),
+    "plain_gtc": dict(time_in_force="good_till_canceled", ttl=False, post_only=None, cancel_order_on_pause=None, stp="taker_at_cross"),
+}
+
+
+def _variant(client, ticker: str, coid: str, v: dict) -> dict:
+    try:
+        resp = client.create_order(ticker, REST_PRICE, 1, coid, time_in_force=v["time_in_force"],
+                                   expiration_time=int(time.time()) + LONG_TTL_S if v["ttl"] else None,
+                                   post_only=v["post_only"], cancel_order_on_pause=v["cancel_order_on_pause"],
+                                   stp=v["stp"])
+        return {"ok": True, "order_id": resp.get("order_id")}
+    except KalshiAPIError as e:
+        return {"ok": False, "status_code": e.status_code, "error": e.body}
+
+
+def run_variants(client, env: str = KALSHI_ENV) -> dict:
+    """Try each order body on up to two markets; cancel whatever rests."""
+    if env != "demo":
+        raise ValueError(f"maker probe only runs against demo (KALSHI_ENV={env!r})")
+    stamp = int(time.time())
+    markets = []
+    for series in KALSHI_MATCH_SERIES.values():
+        for m in client.list_markets(series, status="open"):
+            if REST_PRICE + 0.01 < _f(m.get("yes_ask_dollars")) < 1:
+                markets.append(m)
+    out: dict = {"env": env, "markets_tried": [], "results": {}}
+    for m in markets[:2]:
+        t = m["ticker"]
+        out["markets_tried"].append({k: m.get(k) for k in ("ticker", "status", "yes_bid_dollars", "yes_ask_dollars",
+                                                          "can_close_early", "market_type")})
+        out["results"][t] = {name: _variant(client, t, f"{MAKER_ORDER_PREFIX}var-{name}-{stamp}", v)
+                             for name, v in VARIANTS.items()}
+    counts: Counter = Counter()
+    out["cleanup_failed"] = _cancel_stale(client, counts)
+    out["cleanup_counts"] = dict(counts)
+    leftovers = [o for o in client.get_orders(status="resting") if str(o.get("client_order_id", "")).startswith(
+        f"{MAKER_ORDER_PREFIX}var-")]
+    out["leftover_resting"] = len(leftovers)
+    out["sample_resting_order"] = None
+    return out
+
+
 def run_probe(client, env: str = KALSHI_ENV, sleep=time.sleep) -> dict:
     if env != "demo":
         raise ValueError(f"maker probe only runs against demo (KALSHI_ENV={env!r})")
@@ -154,6 +202,9 @@ def run_probe(client, env: str = KALSHI_ENV, sleep=time.sleep) -> dict:
 
 def main() -> int:
     try:
+        if "--variants" in sys.argv:
+            print(json.dumps(run_variants(KalshiClient()), indent=2, default=str))
+            return 0
         report = run_probe(KalshiClient())
     except ValueError as e:
         print(f"✗ {e}")

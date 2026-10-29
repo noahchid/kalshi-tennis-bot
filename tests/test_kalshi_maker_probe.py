@@ -16,3 +16,11 @@ def test_maker_probe_runs_against_fake_exchange():
         "rest_order_accepted", "rest_order_listed_as_resting", "rest_order_has_expiry", "cancel_stale_cancelled",
         "post_only_cross_rejected", "expiry_honoured", "fill_read_back", "fill_is_taker_read"}
     assert report["checks"]["rest_order_accepted"] and report["checks"]["cancel_stale_cancelled"]
+
+
+def test_maker_probe_variants_cleans_up():
+    markets = make_event("KXATPMATCH", "30JAN01", "Carlos Alcaraz", "Jannik Sinner", ask1=0.40, ask2=0.62)
+    fake = FakeKalshi(markets=markets, cash=100.0)
+    out = maker_probe.run_variants(fake, env="demo")
+    assert len(out["results"]) == 2 and all(len(v) == len(maker_probe.VARIANTS) for v in out["results"].values())
+    assert out["leftover_resting"] == 0

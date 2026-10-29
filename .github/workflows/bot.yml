@@ -31,6 +31,11 @@ on:
         description: 'Only run the DEMO maker order-path probe (rest, expire, cancel, post-only, fill read-back)'
         type: boolean
         default: false
+      maker_probe_args:
+        description: 'Extra args for the DEMO maker probe (e.g. --variants)'
+        type: choice
+        options: ['', '--variants']
+        default: ''
 
 concurrency:
   group: bot
@@ -108,4 +113,4 @@ jobs:
           trap 'rm -f "$RUNNER_TEMP/kalshi.pem"' EXIT
           printf '%s\n' "$DEMO_PEM" > "$RUNNER_TEMP/kalshi.pem"
           export KALSHI_API_KEY_ID="$DEMO_KEY_ID" KALSHI_PRIVATE_KEY_PATH="$RUNNER_TEMP/kalshi.pem"
-          python3 -m kalshi_bot.maker_probe
+          python3 -m kalshi_bot.maker_probe ${{ github.event.inputs.maker_probe_args }}
