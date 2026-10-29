@@ -29,6 +29,9 @@ class KalshiAuthError(ValueError):
     """Credentials missing or unreadable."""
 
 
+RATE_LIMIT_BACKOFF_S = (1.0, 2.0, 4.0)
+
+
 class KalshiAPIError(RuntimeError):
     """Non-2xx response from Kalshi."""
 
@@ -102,15 +105,20 @@ class KalshiClient:
         auth: bool = True,
     ) -> dict:
         full_path = KALSHI_API_PREFIX + path
-        headers = self._auth_headers(method, full_path) if auth else {}
-        resp = self.session.request(
-            method.upper(),
-            self.base_url + full_path,
-            params=params,
-            json=json_body,
-            headers=headers,
-            timeout=self.timeout,
-        )
+        for attempt in range(len(RATE_LIMIT_BACKOFF_S) + 1):
+            headers = self._auth_headers(method, full_path) if auth else {}
+            resp = self.session.request(
+                method.upper(),
+                self.base_url + full_path,
+                params=params,
+                json=json_body,
+                headers=headers,
+                timeout=self.timeout,
+            )
+            # 429 means Kalshi did not process the request: back off and retry (re-signed).
+            if resp.status_code != 429 or attempt == len(RATE_LIMIT_BACKOFF_S):
+                break
+            time.sleep(RATE_LIMIT_BACKOFF_S[attempt])
         if resp.status_code >= 400:
             raise KalshiAPIError(resp.status_code, resp.text)
         return resp.json()

@@ -230,3 +230,37 @@ def test_get_fills_paginates(key_path):
     c2 = KalshiClient("kid", str(path), base_url="https://x.test", session=s2)
     assert c2.get_fills() == []
     assert "min_ts" not in s2.calls[0]["params"] and "ticker" not in s2.calls[0]["params"]
+
+
+def test_rate_limited_request_is_retried_with_backoff(key_path, monkeypatch):
+    # Kalshi answers a burst with 429 too_many_requests; the request was not processed,
+    # so it is retried (re-signed, fresh timestamp) after a short backoff.
+    path, _ = key_path
+    slept = []
+    monkeypatch.setattr("kalshi_bot.client.time.sleep", lambda s: slept.append(s))
+    s = _Session([_Resp({"error": {"code": "too_many_requests"}}, status=429),
+                  _Resp({"error": {"code": "too_many_requests"}}, status=429),
+                  _Resp({"balance": 100})])
+    c = KalshiClient("kid", str(path), base_url="https://x.test", session=s)
+    assert c.get_balance() == 1.0
+    assert len(s.calls) == 3 and slept == [1.0, 2.0]
+
+
+def test_rate_limit_gives_up_after_bounded_retries(key_path, monkeypatch):
+    path, _ = key_path
+    monkeypatch.setattr("kalshi_bot.client.time.sleep", lambda s: None)
+    s = _Session([_Resp({"error": {}}, status=429)] * 5)
+    c = KalshiClient("kid", str(path), base_url="https://x.test", session=s)
+    with pytest.raises(KalshiAPIError) as e:
+        c.get_balance()
+    assert e.value.status_code == 429 and len(s.calls) == 4
+
+
+def test_other_errors_are_not_retried(key_path, monkeypatch):
+    path, _ = key_path
+    monkeypatch.setattr("kalshi_bot.client.time.sleep", lambda s: pytest.fail("no retry on 500"))
+    s = _Session([_Resp({"error": {}}, status=500)])
+    c = KalshiClient("kid", str(path), base_url="https://x.test", session=s)
+    with pytest.raises(KalshiAPIError):
+        c.get_balance()
+    assert len(s.calls) == 1
