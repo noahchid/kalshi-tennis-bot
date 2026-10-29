@@ -5,7 +5,7 @@ bot's own client calls and helpers, and prints a JSON report:
 
 1. a post-only, expiring bid far below the market rests, and comes back from
    GET /portfolio/orders?status=resting with its expiry (the bot's _has_expiry);
-2. resting collateral is reserved out of the balance;
+2. (informational) whether the balance drops while a bid rests — on demo it does not;
 3. the bot's _cancel_stale cancels it and it leaves the resting list;
 4. a post-only bid at the ask is rejected (never takes liquidity);
 5. an order sent with a ~70 s expiry is gone from the resting list after it;
@@ -177,14 +177,22 @@ def run_probe(client, env: str = KALSHI_ENV, sleep=time.sleep) -> dict:
     checks["rest_order_has_expiry"] = bool(rest) and _has_expiry(rest[0])
     bal1 = client.get_balance(exchange_index=KALSHI_TENNIS_EXCHANGE_INDEX)
     report["balance_before_after_rest"] = [bal0, bal1]
-    checks["resting_collateral_reserved"] = bal1 < bal0
+    # Observed on demo: the balance is not reduced by resting bids (informational, not a check).
+    report["balance_reduced_by_resting"] = bal1 < bal0
 
     # 3. the bot's own cancel path
     counts: Counter = Counter()
     failed = _cancel_stale(client, counts)
     report["cancel_counts"], report["cancel_failed"] = dict(counts), failed
     checks["cancel_stale_cancelled"] = counts["cancelled"] >= 1 and not failed
-    checks["cancelled_order_gone"] = not _resting(client, coid)
+    gone = False
+    for i in range(6):  # the listing lags cancels by a few seconds too
+        if not _resting(client, coid):
+            gone = True
+            break
+        sleep(2)
+    checks["cancelled_order_gone"] = gone
+    report["rest_order_view_after_cancel"] = _order_view(client, report["rest_order"].get("response"))
 
     # 4. post-only at the ask must be rejected
     ask = _f(market.get("yes_ask_dollars"))
