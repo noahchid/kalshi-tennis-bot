@@ -59,6 +59,33 @@ def test_signed_request_signs_full_path_without_query(key_path):
     )
 
 
+def test_signed_request_with_ed25519_key(tmp_path):
+    # Kalshi also issues (and recommends) Ed25519 keys: same headers and pre-sign
+    # text, but the key signs the text directly (no PSS padding / hash argument).
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    key = ed25519.Ed25519PrivateKey.generate()
+    path = tmp_path / "demokey.txt"  # Kalshi's download is PKCS#8 PEM text, whatever the extension
+    path.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                       serialization.NoEncryption()))
+    s = _Session([_Resp({"balance": 500})])
+    c = KalshiClient("kid", str(path), base_url="https://x.test", session=s)
+    assert c.get_balance() == 5.0
+    h = s.calls[0]["headers"]
+    msg = (h["KALSHI-ACCESS-TIMESTAMP"] + "GET" + "/trade-api/v2/portfolio/balance").encode()
+    key.public_key().verify(base64.b64decode(h["KALSHI-ACCESS-SIGNATURE"]), msg)
+
+
+def test_unsupported_key_type_is_an_auth_error(tmp_path):
+    from cryptography.hazmat.primitives.asymmetric import ec
+    key = ec.generate_private_key(ec.SECP256R1())
+    path = tmp_path / "k.pem"
+    path.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                       serialization.NoEncryption()))
+    c = KalshiClient("kid", str(path), base_url="https://x.test", session=_Session([_Resp({})]))
+    with pytest.raises(KalshiAuthError, match="RSA or Ed25519"):
+        c.get_balance()
+
+
 def test_balance_accepts_dollar_field(key_path):
     path, _ = key_path
     s = _Session([_Resp({"balance_dollars": "50.25"})])

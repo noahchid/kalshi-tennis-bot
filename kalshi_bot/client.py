@@ -14,7 +14,7 @@ from typing import Any
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
 
 from kalshi_bot.config import (
     KALSHI_API_KEY_ID,
@@ -74,11 +74,19 @@ class KalshiClient:
     def _auth_headers(self, method: str, full_path: str) -> dict[str, str]:
         ts = str(int(time.time() * 1000))
         msg = f"{ts}{method.upper()}{full_path.split('?', 1)[0]}".encode()
-        sig = self._key().sign(
-            msg,
-            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
-            hashes.SHA256(),
-        )
+        key = self._key()
+        # Kalshi picks the verifier from the registered public key: Ed25519 keys
+        # sign the pre-sign text directly, RSA keys use RSA-PSS with SHA-256.
+        if isinstance(key, ed25519.Ed25519PrivateKey):
+            sig = key.sign(msg)
+        elif isinstance(key, rsa.RSAPrivateKey):
+            sig = key.sign(
+                msg,
+                padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+                hashes.SHA256(),
+            )
+        else:
+            raise KalshiAuthError("Kalshi private key must be RSA or Ed25519")
         return {
             "KALSHI-ACCESS-KEY": self.api_key_id,
             "KALSHI-ACCESS-TIMESTAMP": ts,
