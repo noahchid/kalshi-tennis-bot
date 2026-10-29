@@ -214,15 +214,26 @@ def run_probe(client, env: str = KALSHI_ENV, sleep=time.sleep) -> dict:
     checks["expiry_honoured"] = listed_before == 1 and listed_after == 0 and status_after not in (None, "resting")
     _cancel_stale(client, Counter())
 
-    # 6. a real fill, read back by the bot's parser
+    # 6. a real fill, read back by the bot's parser. Demo asks are thin (earlier probe buys
+    # can take them), so re-read live asks and try the cheapest markets until one fills.
     t0 = pd.Timestamp.now(tz="UTC")
-    ioc_coid = f"atpedge-probe-fill-{stamp}"
-    try:
-        ioc = client.create_order(ticker, ask, 1, ioc_coid)  # today's taker IOC path
-        report["ioc_order"] = {"ok": True, "response": ioc}
-    except KalshiAPIError as e:
-        ioc = None
-        report["ioc_order"] = {"ok": False, "status_code": e.status_code, "error": e.body}
+    ioc, attempts = None, []
+    candidates = sorted((m for series in KALSHI_MATCH_SERIES.values()
+                         for m in client.list_markets(series, status="open")
+                         if 0 < _f(m.get("yes_ask_dollars")) < 1), key=lambda m: _f(m.get("yes_ask_dollars")))
+    for m in candidates[:4]:
+        coid_i = f"atpedge-probe-fill-{stamp}-{len(attempts)}"
+        try:
+            resp = client.create_order(m["ticker"], _f(m["yes_ask_dollars"]), 1, coid_i)  # today's taker IOC path
+        except KalshiAPIError as e:
+            attempts.append({"ticker": m["ticker"], "ok": False, "status_code": e.status_code, "error": e.body})
+            continue
+        attempts.append({"ticker": m["ticker"], "ok": True, "fill_count": resp.get("fill_count")})
+        if _f(resp.get("fill_count")) >= 1:
+            ioc = resp
+            break
+    report["ioc_attempts"] = attempts
+    report["ioc_order"] = ioc
     sleep(5)
     raw = [f for f in client.get_fills(min_ts=int(t0.timestamp()) - 60)
            if ioc and str(f.get("order_id")) == str(ioc.get("order_id"))]
