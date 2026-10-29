@@ -27,6 +27,10 @@ on:
         description: 'Only run the DEMO order-path probe'
         type: boolean
         default: false
+      kalshi_maker_probe:
+        description: 'Only run the DEMO maker order-path probe (rest, expire, cancel, post-only, fill read-back)'
+        type: boolean
+        default: false
 
 concurrency:
   group: bot
@@ -53,7 +57,7 @@ jobs:
         run: python3 -m pytest tests -q
 
       - name: Bet
-        if: github.event.inputs.kalshi_probe != 'true'
+        if: github.event.inputs.kalshi_probe != 'true' && github.event.inputs.kalshi_maker_probe != 'true'
         env:
           KALSHI_ENV: ${{ github.event.inputs.kalshi_env || vars.KALSHI_ENV || 'demo' }}
           BETTING_MODE: ${{ github.event.inputs.betting_mode || vars.BETTING_MODE || 'dry_run' }}
@@ -91,3 +95,17 @@ jobs:
           printf '%s\n' "$DEMO_PEM" > "$RUNNER_TEMP/kalshi.pem"
           export KALSHI_API_KEY_ID="$DEMO_KEY_ID" KALSHI_PRIVATE_KEY_PATH="$RUNNER_TEMP/kalshi.pem"
           python3 -m kalshi_bot.probe
+
+      - name: Demo maker probe
+        if: github.event.inputs.kalshi_maker_probe == 'true'
+        env:
+          KALSHI_ENV: demo
+          DEMO_KEY_ID: ${{ secrets.KALSHI_DEMO_KEY_ID }}
+          DEMO_PEM: ${{ secrets.KALSHI_DEMO_PRIVATE_KEY }}
+        run: |
+          set -o pipefail
+          umask 077
+          trap 'rm -f "$RUNNER_TEMP/kalshi.pem"' EXIT
+          printf '%s\n' "$DEMO_PEM" > "$RUNNER_TEMP/kalshi.pem"
+          export KALSHI_API_KEY_ID="$DEMO_KEY_ID" KALSHI_PRIVATE_KEY_PATH="$RUNNER_TEMP/kalshi.pem"
+          python3 -m kalshi_bot.maker_probe
