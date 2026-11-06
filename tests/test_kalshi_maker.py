@@ -24,9 +24,9 @@ def _ev(name="E1", pick=(0.44, 0.48), other=(0.50, 0.54), occ=OCC):
     )
 
 
-def _plan(events, positions=None, budget=10.0, state=None, now=NOW, stop_hours=4.0):
+def _plan(events, positions=None, budget=10.0, state=None, now=NOW, stop_hours=4.0, costs=None):
     state = state if state is not None else MakerState()
-    quotes, skips = plan_quotes(events, positions or {}, budget, state, now, stop_hours)
+    quotes, skips = plan_quotes(events, positions or {}, budget, state, now, stop_hours, costs=costs)
     return quotes, skips, state
 
 
@@ -157,7 +157,7 @@ def test_event_fully_dropped_by_budget_records_no_first_mids():
 
 def test_event_with_one_market_dropped_records_both_sides():
     state = MakerState()
-    _plan([_ev()], positions={"E1-P": 6}, state=state)
+    _plan([_ev()], positions={"E1-P": 6}, costs={"E1-P": 0.44}, state=state)
     assert state.first_mid("E1", "E1-P") == pytest.approx(0.46)
     assert state.first_mid("E1", "E1-O") == pytest.approx(0.52)
 
@@ -189,9 +189,9 @@ def test_extreme_side_with_large_move_retires():
 
 
 def test_position_cap_boundary():
-    quotes, skips, _ = _plan([_ev()], positions={"E1-P": 5})
+    quotes, skips, _ = _plan([_ev()], positions={"E1-P": 5}, costs={"E1-P": 0.44})
     assert len(quotes) == 2 and not skips
-    quotes, skips, _ = _plan([_ev()], positions={"E1-P": 6})
+    quotes, skips, _ = _plan([_ev()], positions={"E1-P": 6}, costs={"E1-P": 0.44})
     assert [q.market_ticker for q in quotes] == ["E1-O"]
     assert skips == {"position_cap": 1}
 
@@ -346,7 +346,7 @@ def test_fill_recorded_once_across_two_runs():
 
 
 def test_partial_fill_of_two_counts_toward_cap():
-    fake = _mfake(positions=[{"ticker": DUC, "position_fp": "4.00"}])
+    fake = _mfake(positions=[{"ticker": DUC, "position_fp": "4.00", "market_exposure_dollars": "1.76"}])
     state, seen = MakerState(), set()
     first, _, _ = _mrun(fake, state=state, seen=seen)
     assert {r["market_ticker"] for r in first} == {DUC, SON}  # 4 + 5 <= 10
@@ -473,10 +473,11 @@ def test_fill_field_fallbacks():
 
 
 def test_unreadable_position_fails_closed():
+    # DUC is never quoted; nor is SON, since DUC's holding (and so the pair lock) is unknown
     fake = _mfake(positions=[{"ticker": DUC}])
     quotes, _, counts = _mrun(fake)
-    assert [r["market_ticker"] for r in quotes] == [SON]
-    assert counts["position_cap"] == 1
+    assert quotes == []
+    assert counts["position_cap"] == 1 and counts["pair_cost_unknown"] == 1
 
 
 def test_resting_budget_is_fraction_of_bankroll():
@@ -703,8 +704,8 @@ def test_orders_with_expiry_are_left_resting(field):
 def test_non_finite_position_fails_closed(pos):
     fake = _mfake(positions=[{"ticker": DUC, "position_fp": pos}])
     quotes, _, counts = _mrun(fake)
-    assert [r["market_ticker"] for r in quotes] == [SON]
-    assert counts["position_cap"] == 1
+    assert quotes == []
+    assert counts["position_cap"] == 1 and counts["pair_cost_unknown"] == 1
 
 
 def test_cancel_failure_on_order_without_ticker_blocks_every_market():
@@ -714,3 +715,75 @@ def test_cancel_failure_on_order_without_ticker_blocks_every_market():
     assert not _creates(fake)
     assert len(quotes) == 2 and {r["status"] for r in quotes} == {"cancel_failed"}
     assert all(r["error"] for r in quotes) and counts["cancel_failed"] == 2
+
+
+# ── pair lock: never pay more for the other side than locks a profit ─────────
+
+from kalshi_bot.maker import pair_lock_cap  # noqa: E402
+
+
+def _fee(p):
+    return 0.0175 * p * (1 - p)
+
+
+@pytest.mark.parametrize("held", [0.32, 0.45, 0.50, 0.57, 0.65, 0.68])
+def test_pair_lock_cap_locks_at_least_the_margin_after_fees(held):
+    cap = pair_lock_cap(held)
+    assert cap == round(cap, 2)  # whole cents
+    assert 1 - held - _fee(held) - cap - _fee(cap) >= 0.01 - 1e-9
+    nxt = cap + 0.01  # one tick higher would not lock the margin
+    assert 1 - held - _fee(held) - nxt - _fee(nxt) < 0.01
+
+
+def test_pair_lock_cap_for_observed_paddevs():
+    # held DEV at 0.65: PAG may cost at most 0.33 (it actually filled at 0.37)
+    assert pair_lock_cap(0.65) == pytest.approx(0.33)
+
+
+def test_other_side_capped_below_bid_when_one_side_held():
+    # E1-O held 5 at 0.50; E1-P bid 0.44 is under its cap (0.48): quoted at the bid
+    # E1-P held 5 at 0.56: E1-O bid 0.50 is over its cap (0.42): quoted at the cap
+    q, s, _ = _plan([_ev()], positions={"E1-O": 5}, costs={"E1-O": 0.50})
+    by = {x.market_ticker: x for x in q}
+    assert by["E1-P"].price == pytest.approx(0.44) and by["E1-O"].price == pytest.approx(0.50)
+    q, s, _ = _plan([_ev()], positions={"E1-P": 5}, costs={"E1-P": 0.56})
+    by = {x.market_ticker: x for x in q}
+    assert by["E1-O"].price == pytest.approx(pair_lock_cap(0.56)) and by["E1-O"].price < 0.50
+    assert by["E1-O"].yes_bid == pytest.approx(0.50)  # the book is still logged as seen
+    assert by["E1-P"].price == pytest.approx(0.44)  # the held side itself is not capped
+    assert not s
+
+
+def test_balanced_pair_is_not_capped():
+    q, s, _ = _plan([_ev()], positions={"E1-P": 5, "E1-O": 5}, costs={"E1-P": 0.44, "E1-O": 0.60})
+    assert {x.market_ticker: x.price for x in q} == {"E1-P": 0.44, "E1-O": 0.50} and not s
+
+
+def test_cap_below_min_bid_skips_with_pair_lock():
+    # held P at 0.93 -> cap 0.05 or less; the other side's bid 0.50 is never posted
+    q, s, _ = _plan([_ev()], positions={"E1-P": 5}, costs={"E1-P": 0.95})
+    assert [x.market_ticker for x in q] == ["E1-P"] and s == {"pair_lock": 1}
+
+
+def test_unknown_cost_of_held_side_fails_closed():
+    q, s, _ = _plan([_ev()], positions={"E1-P": 5})
+    assert [x.market_ticker for x in q] == ["E1-P"] and s == {"pair_cost_unknown": 1}
+    q, s, _ = _plan([_ev()], positions={"E1-P": 5}, costs={"E1-P": float("nan")})
+    assert [x.market_ticker for x in q] == ["E1-P"] and s == {"pair_cost_unknown": 1}
+
+
+def test_run_maker_caps_other_side_from_kalshi_exposure():
+    # DUC held 5 for 2.25 (0.45 each): SON bid 0.56 is capped to pair_lock_cap(0.45)
+    fake = _mfake(positions=[{"ticker": DUC, "position_fp": "5.00", "market_exposure_dollars": "2.25"}])
+    quotes, _, _ = _mrun(fake)
+    by = {r["market_ticker"]: r for r in quotes}
+    assert by[SON]["price"] == pytest.approx(pair_lock_cap(0.45)) and by[SON]["yes_bid"] == pytest.approx(0.56)
+    son_sent = next(o for o in fake.placed if o["ticker"] == SON)
+    assert son_sent["price"] == pytest.approx(pair_lock_cap(0.45))
+
+
+def test_run_maker_missing_exposure_fails_closed_for_other_side():
+    fake = _mfake(positions=[{"ticker": DUC, "position_fp": "5.00"}])
+    quotes, _, counts = _mrun(fake)
+    assert [r["market_ticker"] for r in quotes] == [DUC]
+    assert counts["pair_cost_unknown"] == 1

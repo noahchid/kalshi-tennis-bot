@@ -81,6 +81,10 @@ MAKER_MAX_POSITION = 10
 MAKER_RESTING_BUDGET = 0.40
 MAKER_ORDER_TTL_MIN = 14
 MAKER_ORDER_PREFIX = KALSHI_ORDER_PREFIX + "mk-"
+# Pair lock: once one side of a match is held, the other side is bid at most at the
+# price that still locks MAKER_PAIR_LOCK_MARGIN per pair after both legs' maker fees.
+MAKER_FEE_RATE = 0.0175        # Kalshi maker fee = rate * p * (1 - p) per contract
+MAKER_PAIR_LOCK_MARGIN = 0.01
 
 # ── State (a dedicated private repo, via the GitHub contents API) ────────────
 STATE_REPO = os.environ.get("STATE_REPO", "")

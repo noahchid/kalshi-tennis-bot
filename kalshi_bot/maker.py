@@ -16,9 +16,11 @@ from kalshi_bot.config import (
     MAKER_MAX_POSITION,
     MAKER_MAX_SPREAD,
     MAKER_MIN_BID,
+    MAKER_FEE_RATE,
     MAKER_ORDER_COUNT,
     MAKER_ORDER_PREFIX,
     MAKER_ORDER_TTL_MIN,
+    MAKER_PAIR_LOCK_MARGIN,
     MAKER_RESTING_BUDGET,
     MAKER_RETIRE_MOVE,
     MAKER_STOP_HOURS,
@@ -151,6 +153,21 @@ def _wide(book: Book) -> bool:
     return book.yes_ask - book.yes_bid > MAKER_MAX_SPREAD + _EPS
 
 
+def _maker_fee(p: float) -> float:
+    return MAKER_FEE_RATE * p * (1 - p)
+
+
+def pair_lock_cap(held_cost: float) -> float:
+    """Highest whole-cent bid on the other side of a match whose side is held at
+    `held_cost` per contract, such that one contract of each pays $1 and still nets
+    MAKER_PAIR_LOCK_MARGIN after both legs' maker fees. May be <= 0."""
+    limit = 1 - held_cost - _maker_fee(held_cost) - MAKER_PAIR_LOCK_MARGIN
+    cents = math.floor(limit * 100 + _EPS)
+    while cents > 0 and cents / 100 + _maker_fee(cents / 100) > limit + _EPS:
+        cents -= 1
+    return cents / 100
+
+
 def plan_quotes(
     events: list[EventBooks],
     positions: dict[str, float],
@@ -158,15 +175,24 @@ def plan_quotes(
     state: MakerState,
     now: pd.Timestamp,
     stop_hours: float,
+    costs: dict[str, float] | None = None,
 ) -> tuple[list[Quote], Counter]:
     """Bids to post this run, plus skip-reason counts.
 
     Event-level reasons (retired, no_start_time, too_close_to_start, retire_move)
     count once per event; market-level reasons (book_extreme, wide_spread,
-    position_cap, budget) count once per market. Mutates `state`: records first
-    mids (only for events that get a quote) and retires events. A halted state
-    plans nothing (reason "halted", counted once).
+    position_cap, pair_cost_unknown, pair_lock, budget) count once per market.
+    Mutates `state`: records first mids (only for events that get a quote) and
+    retires events. A halted state plans nothing (reason "halted", counted once).
+
+    Pair lock: when the other side of a match holds more contracts than this side,
+    this side is bid at min(best bid, pair_lock_cap(other side's average cost)), so
+    a fill can only lock in a profit. `costs` is the average cost per contract of
+    each held market; a held side with no finite cost fails closed (the other side
+    is not quoted, "pair_cost_unknown"), and a cap under MAKER_MIN_BID skips
+    ("pair_lock"). A capped quote keeps the book's yes_bid, so price < yes_bid marks it.
     """
+    costs = costs or {}
     skips: Counter = Counter()
     if state.halted:  # a maker fill took liquidity: nothing until the flag is cleared by hand
         skips["halted"] += 1
@@ -210,14 +236,26 @@ def plan_quotes(
 
         by_event[ev.event_ticker] = ev
         for book in quotable:
-            if positions.get(book.market_ticker, 0.0) + MAKER_ORDER_COUNT > MAKER_MAX_POSITION:
+            held = positions.get(book.market_ticker, 0.0)
+            if held + MAKER_ORDER_COUNT > MAKER_MAX_POSITION:
                 skips["position_cap"] += 1
                 continue
+            price = book.yes_bid
+            other = next(b for b in ev.books if b is not book)
+            if positions.get(other.market_ticker, 0.0) > held + _EPS:
+                cost = costs.get(other.market_ticker)
+                if cost is None or not math.isfinite(cost):
+                    skips["pair_cost_unknown"] += 1
+                    continue
+                price = min(price, pair_lock_cap(cost))
+                if price < MAKER_MIN_BID - _EPS:
+                    skips["pair_lock"] += 1
+                    continue
             candidates.append(Quote(
                 event_ticker=ev.event_ticker,
                 market_ticker=book.market_ticker,
                 role=book.role,
-                price=book.yes_bid,
+                price=price,
                 count=MAKER_ORDER_COUNT,
                 mid=_mid(book),
                 yes_bid=book.yes_bid,
@@ -464,17 +502,36 @@ def _cancel_unexpiring(client, rows: list[dict], now: pd.Timestamp, mode: str, k
     return out
 
 
-def _positions(client) -> dict[str, float]:
-    """Contracts held per market; an unreadable position fails closed (never quoted)."""
+def _exposure(p: dict) -> float | None:
+    """A position's cost in dollars; None when Kalshi gives neither field."""
+    for key, scale in (("market_exposure_dollars", 1.0), ("market_exposure", 100.0)):
+        if p.get(key) is not None:
+            try:
+                return float(p[key]) / scale
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _positions(client) -> tuple[dict[str, float], dict[str, float]]:
+    """(contracts held per market, average cost per contract of each long position).
+
+    An unreadable position fails closed (inf: never quoted). A held market with no
+    readable exposure, or a short one, gets no cost, so the pair lock fails closed."""
     out: dict[str, float] = {}
+    costs: dict[str, float] = {}
     for p in client.get_positions():
         pos = get_position_fp(p)
         try:
-            n = abs(float(pos))
+            signed = float(pos)
         except (TypeError, ValueError):
-            n = math.inf
+            signed = math.nan
+        n = abs(signed)
         out[p["ticker"]] = n if math.isfinite(n) else math.inf
-    return out
+        exposure = _exposure(p)
+        if math.isfinite(signed) and signed > 0 and exposure is not None and math.isfinite(exposure):
+            costs[p["ticker"]] = exposure / signed
+    return out, costs
 
 
 def run_maker(mode: str, client, plays, state: MakerState, fills_seen: set[str],
@@ -518,9 +575,9 @@ def run_maker(mode: str, client, plays, state: MakerState, fills_seen: set[str],
             continue
         events.setdefault(ev.event_ticker, ev)
 
-    positions = _positions(client)
+    positions, costs = _positions(client)
     quotes, skips = plan_quotes(list(events.values()), positions, MAKER_RESTING_BUDGET * bankroll,
-                                state, now, MAKER_STOP_HOURS)
+                                state, now, MAKER_STOP_HOURS, costs=costs)
     counts.update(skips)
 
     attempt = str(int(now.timestamp()))
