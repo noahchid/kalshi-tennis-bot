@@ -17,16 +17,19 @@ def _book(ticker, role, bid, ask):
     return Book(ticker, role, bid, ask, 20.0, 20.0)
 
 
-def _ev(name="E1", pick=(0.44, 0.48), other=(0.50, 0.54), occ=OCC):
+def _ev(name="E1", pick=(0.44, 0.48), other=(0.50, 0.54), occ=OCC, start=None):
     return EventBooks(
         event_ticker=name, occurrence_time=occ, level="tour",
         books=(_book(f"{name}-P", "pick", *pick), _book(f"{name}-O", "other", *other)),
+        start_time=start,
     )
 
 
-def _plan(events, positions=None, budget=10.0, state=None, now=NOW, stop_hours=4.0, costs=None):
+def _plan(events, positions=None, budget=10.0, state=None, now=NOW, stop_hours=4.0, costs=None,
+          stop_minutes=60.0):
     state = state if state is not None else MakerState()
-    quotes, skips = plan_quotes(events, positions or {}, budget, state, now, stop_hours, costs=costs)
+    quotes, skips = plan_quotes(events, positions or {}, budget, state, now, stop_hours, costs=costs,
+                                stop_minutes=stop_minutes)
     return quotes, skips, state
 
 
@@ -787,3 +790,47 @@ def test_run_maker_missing_exposure_fails_closed_for_other_side():
     quotes, _, counts = _mrun(fake)
     assert [r["market_ticker"] for r in quotes] == [DUC]
     assert counts["pair_cost_unknown"] == 1
+
+
+
+# ── scheduled start (plays.json match_time) — season-2027 plan Task 2 ──────
+
+def test_match_time_stop_is_earlier_than_occurrence_rule():
+    start = OCC - pd.Timedelta(hours=5)
+    quotes, skips, _ = _plan([_ev(start=start)], now=start - pd.Timedelta(minutes=59))
+    assert not quotes and skips == {"too_close_to_start": 1}
+    quotes, skips, _ = _plan([_ev(start=start)], now=start - pd.Timedelta(minutes=61))
+    assert len(quotes) == 2 and not skips
+
+
+def test_occurrence_rule_still_wins_when_earlier():
+    quotes, skips, _ = _plan([_ev(start=OCC + pd.Timedelta(hours=3))], now=OCC - pd.Timedelta(hours=4))
+    assert not quotes and skips == {"too_close_to_start": 1}
+
+
+def test_no_match_time_behaves_as_today():
+    boundary = OCC - pd.Timedelta(hours=4)
+    assert _plan([_ev(start=None)], now=boundary)[1] == {"too_close_to_start": 1}
+    assert len(_plan([_ev(start=None)], now=boundary - pd.Timedelta(minutes=1))[0]) == 2
+
+
+def test_only_match_time_known():
+    assert len(_plan([_ev(occ=None, start=NOW + pd.Timedelta(hours=2))])[0]) == 2
+    assert _plan([_ev(occ=None, start=None)])[1] == {"no_start_time": 1}
+
+
+def test_past_match_time_stops_quoting():
+    quotes, skips, _ = _plan([_ev(start=NOW - pd.Timedelta(hours=1))])
+    assert not quotes and skips == {"too_close_to_start": 1}
+
+
+def test_quote_expiration_capped_at_stop():
+    match_time = RUN_NOW + pd.Timedelta(minutes=70)
+    play = Play(pd.Timestamp("2026-10-29"), "James Duckworth", "Lorenzo Sonego", 0.60, "Some Open", "A", 0.50,
+                match_time=match_time)
+    fake = _mfake()
+    quotes, _, _ = _mrun(fake, plays=[play])
+    stop = int((match_time - pd.Timedelta(minutes=60)).timestamp())
+    assert stop < int(RUN_NOW.timestamp()) + 14 * 60
+    assert len(fake.placed) == 2 and {p["expiration_time"] for p in fake.placed} == {stop}
+    assert {r["expiration_time"] for r in quotes} == {stop}

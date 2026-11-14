@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pandas as pd
 
@@ -24,6 +24,7 @@ from kalshi_bot.config import (
     MAKER_RESTING_BUDGET,
     MAKER_RETIRE_MOVE,
     MAKER_STOP_HOURS,
+    MAKER_STOP_MINUTES,
 )
 from kalshi_bot.fields import get_position_fp
 from kalshi_bot.guard import client_order_id
@@ -42,7 +43,8 @@ class Quote:
     mid: float
     yes_bid: float
     yes_ask: float
-    occurrence: pd.Timestamp
+    occurrence: pd.Timestamp | None
+    stop_at: pd.Timestamp | None = None  # quoting ends here; resting bids expire by then
 
 
 class MakerState:
@@ -168,6 +170,18 @@ def pair_lock_cap(held_cost: float) -> float:
     return cents / 100
 
 
+def stop_time_for(ev: EventBooks, stop_hours: float, stop_minutes: float) -> pd.Timestamp | None:
+    """When quoting this event stops: the earlier of occurrence - stop_hours and the scheduled
+    start - stop_minutes, over whichever is known (None when neither is). A wrong scheduled time can
+    only make the stop earlier than the occurrence rule, never later."""
+    cands = []
+    if ev.occurrence_time is not None:
+        cands.append(ev.occurrence_time - pd.Timedelta(hours=stop_hours))
+    if ev.start_time is not None:
+        cands.append(ev.start_time - pd.Timedelta(minutes=stop_minutes))
+    return min(cands) if cands else None
+
+
 def plan_quotes(
     events: list[EventBooks],
     positions: dict[str, float],
@@ -176,6 +190,7 @@ def plan_quotes(
     now: pd.Timestamp,
     stop_hours: float,
     costs: dict[str, float] | None = None,
+    stop_minutes: float = 60.0,
 ) -> tuple[list[Quote], Counter]:
     """Bids to post this run, plus skip-reason counts.
 
@@ -199,16 +214,16 @@ def plan_quotes(
         return [], skips
     candidates: list[Quote] = []
     by_event: dict[str, EventBooks] = {}
-    stop = pd.Timedelta(hours=stop_hours)
 
     for ev in events:
         if state.is_retired(ev.event_ticker):
             skips["retired"] += 1
             continue
-        if ev.occurrence_time is None:
+        stop_at = stop_time_for(ev, stop_hours, stop_minutes)
+        if stop_at is None:
             skips["no_start_time"] += 1
             continue
-        if now >= ev.occurrence_time - stop:
+        if now >= stop_at:
             skips["too_close_to_start"] += 1
             continue
 
@@ -261,10 +276,11 @@ def plan_quotes(
                 yes_bid=book.yes_bid,
                 yes_ask=book.yes_ask,
                 occurrence=ev.occurrence_time,
+                stop_at=stop_at,
             ))
 
     # Soonest match first, then ticker: the budget goes to the same quotes every run.
-    candidates.sort(key=lambda q: (q.occurrence, q.market_ticker))
+    candidates.sort(key=lambda q: (q.stop_at, q.market_ticker))
     quotes: list[Quote] = []
     spent = 0.0
     for q in candidates:
@@ -573,17 +589,20 @@ def run_maker(mode: str, client, plays, state: MakerState, fills_seen: set[str],
         if ev is None:
             counts["no_event_books"] += 1
             continue
+        if play.match_time is not None:
+            ev = replace(ev, start_time=play.match_time)
         events.setdefault(ev.event_ticker, ev)
 
     positions, costs = _positions(client)
     quotes, skips = plan_quotes(list(events.values()), positions, MAKER_RESTING_BUDGET * bankroll,
-                                state, now, MAKER_STOP_HOURS, costs=costs)
+                                state, now, MAKER_STOP_HOURS, costs=costs, stop_minutes=MAKER_STOP_MINUTES)
     counts.update(skips)
 
     attempt = str(int(now.timestamp()))
-    expiration = int(now.timestamp()) + MAKER_ORDER_TTL_MIN * 60
+    ttl_expiration = int(now.timestamp()) + MAKER_ORDER_TTL_MIN * 60
     rows: list[dict] = []
     for q in quotes:
+        expiration = ttl_expiration if q.stop_at is None else min(ttl_expiration, int(q.stop_at.timestamp()))
         coid = client_order_id(q.event_ticker, q.market_ticker, attempt, prefix=MAKER_ORDER_PREFIX)
         row = {
             "logged_at": now, "policy": "maker", "mode": mode, "kalshi_env": kalshi_env,

@@ -72,6 +72,8 @@ MAKER_SWITCH_AT = os.environ.get("MAKER_SWITCH_AT", "") or DEFAULT_MAKER_SWITCH_
 BOT_POLICY = resolve_policy(os.environ.get("BOT_POLICY", ""), MAKER_SWITCH_AT,
                             datetime.now(timezone.utc))  # taker | maker
 MAKER_STOP_HOURS = _float_env("MAKER_STOP_HOURS") or 4.0  # stop quoting this long before start
+# ... and this long before the scheduled start (plays.json match_time), whichever is earlier
+MAKER_STOP_MINUTES = _float_env("MAKER_STOP_MINUTES") or 60.0
 MAKER_RETIRE_MOVE = 0.10   # retire an event once either side's mid moves this far from its first mid
 MAKER_MAX_SPREAD = 0.10
 MAKER_MIN_BID = 0.05

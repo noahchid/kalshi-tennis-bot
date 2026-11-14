@@ -65,6 +65,14 @@ class Play:
     tournament: str
     tournament_level: str
     market_prob: float | None = None
+    match_time: pd.Timestamp | None = None  # scheduled start (UTC); maker stop only, never the taker
+
+
+def _match_time(value) -> pd.Timestamp | None:
+    if value is None:
+        return None
+    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    return None if pd.isna(ts) else ts
 
 
 def load_plays_doc(doc: dict) -> list[Play]:
@@ -74,7 +82,8 @@ def load_plays_doc(doc: dict) -> list[Play]:
         market_prob = r.get("market_prob")
         plays.append(Play(pd.Timestamp(r["pred_date"]), r["player_name"], r["opponent_name"],
                           float(r["model_prob"]), r.get("tournament", ""), str(r.get("tournament_level", "")),
-                          float(market_prob) if market_prob is not None else None))
+                          float(market_prob) if market_prob is not None else None,
+                          _match_time(r.get("match_time"))))
     return plays
 
 
