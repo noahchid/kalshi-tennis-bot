@@ -36,6 +36,7 @@ class EventBooks:
     occurrence_time: pd.Timestamp | None
     level: str
     books: tuple[Book, Book]  # (pick, other)
+    start_time: pd.Timestamp | None = None  # scheduled start from plays.json (UTC), when known
 
 
 def index_open_markets(markets_by_level: dict[str, list[dict]]) -> dict[str, tuple[str, list[dict]]]:

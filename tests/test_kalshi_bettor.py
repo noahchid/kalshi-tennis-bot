@@ -971,3 +971,31 @@ def test_expiry_readback_failure_still_pushes_quotes_and_state_and_exits_1(monke
     assert "expiry_check_failed 1" in out
     for secret in ("KXATP", "26SEP23", "DUCSON", "atpedge", "Duckworth", "rate limited", "0.44", "0.56"):
         assert secret not in out
+
+
+
+# ── plays.json match_time (season-2027 plan Task 2) ───────────────────────
+
+def test_load_plays_doc_match_time():
+    base = {"pred_date": "2026-10-29", "player_name": "A B", "opponent_name": "C D", "model_prob": 0.6}
+    doc = {"plays": [dict(base, match_time="2026-10-29T18:00:00Z"), dict(base, match_time="2026-10-29 18:00"),
+                     dict(base, match_time="garbage"), dict(base, match_time=None), dict(base)]}
+    got = [p.match_time for p in load_plays_doc(doc)]
+    assert got[0] == pd.Timestamp("2026-10-29T18:00:00Z") and got[1] == pd.Timestamp("2026-10-29T18:00:00Z")
+    assert got[2:] == [None, None, None]
+
+
+def test_taker_buffer_ignores_match_time(tmp_path):
+    fake = _fake()
+    play = _play("James Duckworth", "Lorenzo Sonego")
+    play = Play(play.pred_date, play.player_name, play.opponent_name, play.model_prob, play.tournament,
+                play.tournament_level, play.market_prob, match_time=NOW + pd.Timedelta(minutes=30))
+    rows, err = _run(fake, [play], tmp_path)
+    assert not err and len(fake.placed) == 1      # occurrence is 18h away: the taker still bets
+
+
+def test_workflow_passes_maker_stop_minutes():
+    # Final review: a MAKER_STOP_MINUTES repo variable must reach the bot.
+    from pathlib import Path
+    wf = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "bot.yml").read_text()
+    assert "MAKER_STOP_MINUTES: ${{ vars.MAKER_STOP_MINUTES || '60' }}" in wf
