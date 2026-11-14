@@ -71,6 +71,7 @@ jobs:
           BOT_POLICY: ${{ github.event.inputs.bot_policy || vars.BOT_POLICY }}
           MAKER_SWITCH_AT: ${{ vars.MAKER_SWITCH_AT }}
           MAKER_STOP_HOURS: ${{ vars.MAKER_STOP_HOURS || '4' }}
+          MAKER_STOP_MINUTES: ${{ vars.MAKER_STOP_MINUTES || '60' }}
           # Secrets, not vars: step env values from vars print in public logs.
           KALSHI_START_BANKROLL: ${{ secrets.KALSHI_START_BANKROLL }}
           STATE_REPO: ${{ secrets.STATE_REPO }}
