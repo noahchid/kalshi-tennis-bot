@@ -834,3 +834,12 @@ def test_quote_expiration_capped_at_stop():
     assert stop < int(RUN_NOW.timestamp()) + 14 * 60
     assert len(fake.placed) == 2 and {p["expiration_time"] for p in fake.placed} == {stop}
     assert {r["expiration_time"] for r in quotes} == {stop}
+
+
+def test_quotes_within_the_minimum_lead_of_the_stop_are_not_sent():
+    # Kalshi rejects an order expiring in under a few seconds; don't send it (was an error row).
+    boundary = OCC - pd.Timedelta(hours=4)
+    quotes, skips, _ = _plan([_ev()], now=boundary - pd.Timedelta(seconds=1))
+    assert not quotes and skips == {"too_close_to_start": 1}
+    quotes, skips, _ = _plan([_ev()], now=boundary - pd.Timedelta(seconds=30))
+    assert len(quotes) == 2 and not skips

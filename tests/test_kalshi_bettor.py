@@ -999,3 +999,11 @@ def test_workflow_passes_maker_stop_minutes():
     from pathlib import Path
     wf = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "bot.yml").read_text()
     assert "MAKER_STOP_MINUTES: ${{ vars.MAKER_STOP_MINUTES || '60' }}" in wf
+
+
+def test_match_time_of_an_unexpected_type_is_ignored():
+    from kalshi_bot.bettor import _match_time
+    assert _match_time({"utc": "2026-10-29T13:00:00Z"}) is None
+    assert _match_time(["2026-10-29T13:00:00Z"]) is None
+    assert _match_time("not a time") is None
+    assert _match_time("2026-10-29T13:00:00Z") == pd.Timestamp("2026-10-29T13:00:00Z")

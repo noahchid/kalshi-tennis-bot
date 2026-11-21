@@ -112,6 +112,11 @@ class MakerState:
 _STATE_KEYS = ("first_mid", "retired", "halted")
 
 
+
+# Minimum time between placing a quote and its stop (its expiration): Kalshi rejects orders that
+# would expire within seconds, which used to surface as error rows.
+MIN_ORDER_LEAD = pd.Timedelta(seconds=5)
+
 def _env_docs(raw: bytes | str | None) -> dict[str, dict]:
     """The state file as {env: state doc}. The pre-env file (one state at the top
     level, written before demo runs were tagged) is prod's state."""
@@ -223,7 +228,7 @@ def plan_quotes(
         if stop_at is None:
             skips["no_start_time"] += 1
             continue
-        if now >= stop_at:
+        if now >= stop_at - MIN_ORDER_LEAD:     # an order expiring within seconds is rejected by Kalshi
             skips["too_close_to_start"] += 1
             continue
 
