@@ -69,9 +69,14 @@ class Play:
 
 
 def _match_time(value) -> pd.Timestamp | None:
-    if value is None:
+    """Scheduled start from plays.json; anything that isn't a parseable time string is None
+    (a malformed value must never crash the run — the maker then falls back to the occurrence rule)."""
+    if value is None or not isinstance(value, (str, pd.Timestamp)):
         return None
-    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    try:
+        ts = pd.to_datetime(value, utc=True, errors="coerce")
+    except (TypeError, ValueError):
+        return None
     return None if pd.isna(ts) else ts
 
 
