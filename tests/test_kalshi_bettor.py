@@ -1007,3 +1007,40 @@ def test_match_time_of_an_unexpected_type_is_ignored():
     assert _match_time(["2026-10-29T13:00:00Z"]) is None
     assert _match_time("not a time") is None
     assert _match_time("2026-10-29T13:00:00Z") == pd.Timestamp("2026-10-29T13:00:00Z")
+
+
+# --- set-winner maker (dry run) ---
+
+def _set_client():
+    from tests.kalshi_fakes import FakeKalshi
+    c = FakeKalshi(markets=[])
+    sets = [{"ticker": "KXATPCHALLENGERSETWINNER-26NOV26PHABOL-1-PHA", "event_ticker": "KXATPCHALLENGERSETWINNER-26NOV26PHABOL-1",
+             "yes_bid_dollars": "0.6000", "yes_ask_dollars": "0.6400", "occurrence_datetime": "2030-01-01T00:00:00Z"}]
+    match = [{"ticker": "KXATPCHALLENGERMATCH-26NOV26PHABOL-PHA", "event_ticker": "KXATPCHALLENGERMATCH-26NOV26PHABOL",
+              "yes_bid_dollars": "0.7400", "yes_ask_dollars": "0.7600", "occurrence_datetime": "2030-01-01T00:00:00Z"}]
+    real = c.list_markets
+    c.list_markets = lambda series_ticker, status="open", min_close_ts=None: (
+        sets if series_ticker == "KXATPCHALLENGERSETWINNER" else match if series_ticker == "KXATPCHALLENGERMATCH"
+        else real(series_ticker, status=status, min_close_ts=min_close_ts))
+    return c
+
+
+def test_set_maker_dry_run_appends_rows_when_enabled(monkeypatch, tmp_path):
+    import io
+    import kalshi_bot.bettor as bettor_mod
+    monkeypatch.setattr(bettor_mod, "SET_MAKER_MODE", "dry_run")
+    store = _FakeStore({})                                   # no plays.json: the set maker still runs
+    assert _main(monkeypatch, tmp_path, store, _set_client(), mode="live") == 0
+    rows = pd.read_parquet(io.BytesIO(store.files[bettor_mod.SET_QUOTES_FILE]))
+    assert len(rows) >= 1 and set(rows["mode"]) == {"dry_run"}
+
+
+def test_set_maker_off_by_default_and_failure_never_fails_the_run(monkeypatch, tmp_path):
+    import kalshi_bot.bettor as bettor_mod
+    store = _FakeStore({})
+    assert _main(monkeypatch, tmp_path, store, _set_client(), mode="live") == 0
+    assert bettor_mod.SET_QUOTES_FILE not in store.files          # off by default
+    monkeypatch.setattr(bettor_mod, "SET_MAKER_MODE", "dry_run")
+    boom = _set_client()
+    boom.list_markets = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down"))
+    assert _main(monkeypatch, tmp_path, _FakeStore({}), boom, mode="live") == 0

@@ -40,7 +40,7 @@ from kalshi_bot.config import (
     KALSHI_START_BUFFER_MINUTES,
     PLAYS_MAX_AGE_HOURS,
     STATE_BRANCH,
-    STATE_REPO,
+    STATE_REPO, SET_MAKER_MODE,
 )
 from kalshi_bot.client import KalshiAPIError, KalshiClient
 from kalshi_bot.bankroll import fetch_bankroll
@@ -309,6 +309,7 @@ def _push_bet_log(store, new_rows: pd.DataFrame, sha: str | None) -> None:
 # ── Maker policy state (private state repo) ──────────────────────────────────
 
 QUOTES_FILE = "kalshi_quotes.parquet"
+SET_QUOTES_FILE = "set_maker_quotes.parquet"   # set-winner maker dry-run log
 MAKER_FILLS_FILE = "kalshi_maker_fills.parquet"
 MAKER_STATE_FILE = "kalshi_maker_state.json"
 _MAKER_STATUSES = ("placed", "dry_run", "shadow_quote", "error", "cancel_failed")
@@ -509,6 +510,21 @@ def _taker_step(mode: str, client, plays: list[Play], store, now: pd.Timestamp, 
     return had_error
 
 
+def _set_maker_step(client, store, now: pd.Timestamp) -> None:
+    """Set-winner maker, dry run only: log the bids it would rest. Never places an order, and
+    never fails the run (public logs: exception type and HTTP status only)."""
+    if SET_MAKER_MODE != "dry_run":
+        return
+    from kalshi_bot.set_maker import SET_QUOTE_COLUMNS, run_set_maker_dry
+    try:
+        rows = run_set_maker_dry(client or KalshiClient(), now)
+        raw, sha = store.get(SET_QUOTES_FILE)
+        _push_appended(store, SET_QUOTES_FILE, raw, sha, rows, SET_QUOTE_COLUMNS, "bot: set maker dry run")
+        print(f"  set maker (dry run): {len(rows)} quotes logged")
+    except Exception as e:
+        print(f"  ✗ set maker (dry run) failed: {_redacted(e)}")
+
+
 def main(argv: list[str] | None = None, store=None, client=None, now=None) -> int:
     parser = argparse.ArgumentParser(description="Kalshi auto-bettor")
     parser.add_argument("--mode", choices=["off", "dry_run", "live"], default=BETTING_MODE)
@@ -538,6 +554,7 @@ def main(argv: list[str] | None = None, store=None, client=None, now=None) -> in
     try:
         store = store or StateStore(STATE_REPO, STATE_BRANCH, BOT_STATE_TOKEN)
         store.check_branch()
+        _set_maker_step(client, store, now)          # needs no plays; runs before the plays checks
         plays_raw, _ = store.get("plays.json")
         if plays_raw is None:
             print("  no plays.json yet; nothing to do")
